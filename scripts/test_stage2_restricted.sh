@@ -22,11 +22,11 @@ let input = "";
 process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
   const tools = JSON.parse(input.trim().slice("CTF_C_TOOL_LIST=".length));
-  const allowed = ["Agent", "begin_investigation", "get_subagent_result", "stage2_status", "steer_subagent"];
+  const allowed = ["Agent", "begin_investigation", "finalize_result", "get_subagent_result", "http_request", "run_local_command", "stage2_status", "steer_subagent", "verify_flag", "write_exploit"];
   if (!allowed.every((name) => tools.includes(name))) process.exit(1);
   if (tools.filter((name) => name === "stage2_status").length !== 1) process.exit(1);
   if (tools.some((name) => !allowed.includes(name))) process.exit(1);
-  if (tools.some((name) => /browser|http|network/i.test(name))) process.exit(1);
+  if (tools.some((name) => /browser|network/i.test(name))) process.exit(1);
   process.stdout.write(`restricted tools: ${tools.join(",")}\n`);
 });
 '

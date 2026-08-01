@@ -9,6 +9,15 @@
 - **Authorized remote actions:** `none`
 - **User approval record:** `not approved`
 - **Local Docker Compose:** `none`
+- **Authorized:** `false`
+- **Remote actions allowed:** `false`
+- **Target URL:** `none`
+- **Allowed hosts:** `none`
+- **Allowed HTTP methods:** `none`
+- **Allowed action kinds:** `none`
+- **Time budget minutes:** `15`
+- **Action budget:** `20`
+- **Flag regex:** `picoCTF\{[^}\r\n]{1,256}\}`
 - **Time budget:** `15 minutes`
 
 ## Scope

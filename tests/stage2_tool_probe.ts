@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,14 +39,21 @@ export default function (pi: ExtensionAPI) {
     process.stderr.write("CTF_C_INVALID_SLUGS=rejected\n");
     assertChallengeSymlinkIsRejected();
     process.stderr.write("CTF_C_SYMLINKS=rejected\n");
-    const status = readStage2Declaration("secure-email-service-picoctf-web");
-    if (status.category !== "web" || status.authorization_state !== "local-only" || status.authorized_remote_actions !== "none" || status.time_budget !== "15 minutes") {
-      throw new Error("stage2 status metadata mismatch");
-    }
-    process.stderr.write("CTF_C_STATUS=metadata-read\n");
-    const skeleton = beginInvestigation("secure-email-service-picoctf-web");
-    if (skeleton.state !== "ready" || skeleton.phase !== "source_audit" || skeleton.side_effects !== "none") {
-      throw new Error("begin investigation skeleton mismatch");
+    const fixtureSlug = `stage2-restricted-${process.pid}`;
+    const fixturePath = join(process.cwd(), "challenges", fixtureSlug);
+    cpSync(join(process.cwd(), "tests", "fixtures", "web-source-audit"), fixturePath, { recursive: true });
+    try {
+      const status = readStage2Declaration(fixtureSlug);
+      if (status.category !== "web" || status.authorization_state !== "local-only" || status.authorized_remote_actions !== "none" || status.time_budget !== "15 minutes") {
+        throw new Error("stage2 status metadata mismatch");
+      }
+      process.stderr.write("CTF_C_STATUS=metadata-read\n");
+      const skeleton = beginInvestigation(fixtureSlug);
+      if (skeleton.state !== "ready" || skeleton.phase !== "source_audit" || skeleton.side_effects !== "none") {
+        throw new Error("begin investigation skeleton mismatch");
+      }
+    } finally {
+      rmSync(fixturePath, { recursive: true, force: true });
     }
     process.stderr.write("CTF_C_INVESTIGATION=ready\n");
   });
