@@ -341,6 +341,7 @@ function writeEvidence(run, entry, privateContent) {
 function ensureHttpRequest(run, params) {
   if (run.declaration.category !== "web") throw new Error("HTTP requests require Web category");
   if (!run.declaration.approval?.approved) throw new Error("HTTP requests are not authorized");
+  if (params.action_kind === "submit" && process.env.CTFC_STAGE2_NO_SUBMIT === "1") throw new Error("Flag submission is disabled by validation harness");
   if (!HTTP_METHODS.has(params.method) || !run.declaration.allowedMethods.includes(params.method)) throw new Error("HTTP method is not allowed");
   if (!ACTION_KINDS.has(params.action_kind) || !run.declaration.allowedActionKinds.includes(params.action_kind)) throw new Error("Action kind is not allowed");
   if (typeof params.path !== "string" || !params.path.startsWith("/") || params.path.startsWith("//") || /[?\\#@\x00\r\n]/.test(params.path)) throw new Error("Unsafe request path");
@@ -626,7 +627,7 @@ function finalizeResult(params) {
   const verification = params.verified_evidence_id ? activeRun.verifiedFlags.get(params.verified_evidence_id) : null;
   if (params.status === "solved" && !verification) throw new Error("Solved requires verified evidence");
   activeRun.status = params.status;
-  const result = { status: params.status, reason: String(params.reason).slice(0, 500), run_id: activeRun.runId, challenge_slug: activeRun.challengeSlug, action_count: activeRun.actionCount, elapsed_ms: Date.now() - activeRun.startedAt, verified_evidence_id: params.verified_evidence_id ?? null, flag_sha256: verification?.flag_sha256 ?? null, finalized_at: new Date().toISOString() };
+  const result = { status: params.status, reason: String(params.reason).slice(0, 500), run_id: activeRun.runId, challenge_slug: activeRun.challengeSlug, action_count: activeRun.actionCount, hypotheses_generated: activeRun.hypothesisRevision, elapsed_ms: Date.now() - activeRun.startedAt, verified: Boolean(verification), verified_evidence_id: params.verified_evidence_id ?? null, flag_sha256: verification?.flag_sha256 ?? null, finalized_at: new Date().toISOString() };
   atomicWrite(activeRun.runtimePaths.result, `${JSON.stringify(result, null, 2)}\n`);
   atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ ...result, action_count: activeRun.actionCount }, null, 2)}\n`);
   return result;

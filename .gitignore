@@ -1,0 +1,40 @@
+# Secrets and operator data
+.env
+.env.*
+*.pem
+*.key
+*.token
+*.cookie
+cookies.txt
+secrets/
+
+# Pi/runtime state and transcripts
+.pi/sessions/
+.pi/output/
+.pi/subagent-schedules/
+.pi/npm/node_modules/
+.pi/skills/
+.pi/git/
+*.jsonl
+*.log
+
+# Generated challenge content; keep template placeholders tracked.
+challenges/*/artifacts/*
+challenges/*/exploits/*
+challenges/*/source/*
+!challenges/_template/artifacts/.gitkeep
+!challenges/_template/exploits/.gitkeep
+!challenges/_template/source/.gitkeep
+
+# Skill installer metadata and generated links
+.agents/
+skills-lock.json
+
+# Common local tooling
+.DS_Store
+__pycache__/
+.pytest_cache/
+node_modules/
+
+# Validation run output
+results/validation/
