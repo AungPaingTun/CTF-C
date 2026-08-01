@@ -33,22 +33,17 @@ const FORBIDDEN_HEADERS = new Set([
 ]);
 const REQUIRED_FIELDS = [
   "Category",
-  "Target authorization",
-  "Target",
-  "Remote status",
-  "Authorized remote actions",
-  "User approval record",
   "Local Docker Compose",
   "Time budget",
-  "Authorized",
-  "Remote actions allowed",
-  "Target URL",
-  "Allowed hosts",
+  "Flag regex",
+  "Default time budget minutes",
+  "Maximum time budget minutes",
+  "Default action budget",
+  "Maximum action budget",
   "Allowed HTTP methods",
   "Allowed action kinds",
-  "Time budget minutes",
-  "Action budget",
-  "Flag regex",
+  "Allowed host pattern",
+  "Per-run approval required",
 ];
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_PREVIEW_BYTES = 1024;
@@ -72,22 +67,17 @@ export function parseStage2Declaration(declaration) {
   const fields = Object.fromEntries(REQUIRED_FIELDS.map((label) => [label, readField(declaration, label)]));
   return {
     category: fields.Category,
-    authorization_state: fields["Target authorization"],
-    target_state: fields.Target,
-    remote_status: fields["Remote status"],
-    authorized_remote_actions: fields["Authorized remote actions"],
-    user_approval_record: fields["User approval record"],
     local_docker_compose: fields["Local Docker Compose"],
     time_budget: fields["Time budget"],
-    authorized: fields.Authorized,
-    remote_actions_allowed: fields["Remote actions allowed"],
-    target_url: fields["Target URL"],
-    allowed_hosts: fields["Allowed hosts"],
+    flag_regex: fields["Flag regex"],
+    default_time_budget_minutes: fields["Default time budget minutes"],
+    maximum_time_budget_minutes: fields["Maximum time budget minutes"],
+    default_action_budget: fields["Default action budget"],
+    maximum_action_budget: fields["Maximum action budget"],
     allowed_http_methods: fields["Allowed HTTP methods"],
     allowed_action_kinds: fields["Allowed action kinds"],
-    time_budget_minutes: fields["Time budget minutes"],
-    action_budget: fields["Action budget"],
-    flag_regex: fields["Flag regex"],
+    allowed_host_pattern: fields["Allowed host pattern"],
+    per_run_approval_required: fields["Per-run approval required"],
   };
 }
 
@@ -95,50 +85,32 @@ export function validateStage2Declaration(metadata, { execution = false } = {}) 
   const errors = [];
   const foundationFields = [
     "category",
-    "authorization_state",
-    "target_state",
-    "remote_status",
-    "authorized_remote_actions",
-    "user_approval_record",
     "local_docker_compose",
     "time_budget",
+    "flag_regex",
+    "default_time_budget_minutes",
+    "maximum_time_budget_minutes",
+    "default_action_budget",
+    "maximum_action_budget",
+    "allowed_http_methods",
+    "allowed_action_kinds",
+    "allowed_host_pattern",
+    "per_run_approval_required",
   ];
   for (const key of foundationFields) if (!metadata[key]) errors.push(`missing:${key}`);
   if (metadata.category && !CATEGORIES.has(metadata.category)) errors.push("invalid:category");
-  if (metadata.authorization_state && !["local-only", "remote-authorized"].includes(metadata.authorization_state)) errors.push("invalid:authorization_state");
-  if (metadata.target_state && !["local-source-only", "authorized-target"].includes(metadata.target_state)) errors.push("invalid:target_state");
-  if (metadata.remote_status && !["local-only", "remote-authorized"].includes(metadata.remote_status)) errors.push("invalid:remote_status");
-  if (metadata.authorized_remote_actions && !["none", "declared-bounded-actions"].includes(metadata.authorized_remote_actions)) errors.push("invalid:authorized_remote_actions");
-  if (metadata.user_approval_record && !["not approved", "approved"].includes(metadata.user_approval_record)) errors.push("invalid:user_approval_record");
   if (metadata.time_budget && !["15 minutes", "30 minutes"].includes(metadata.time_budget)) errors.push("invalid:time_budget");
-  if (!execution) return errors;
-
-  const requiredExecutionFields = [
-    "authorized",
-    "remote_actions_allowed",
-    "target_url",
-    "allowed_hosts",
-    "allowed_http_methods",
-    "allowed_action_kinds",
-    "time_budget_minutes",
-    "action_budget",
-    "flag_regex",
-  ];
-  for (const key of requiredExecutionFields) if (!metadata[key]) errors.push(`missing:${key}`);
-  if (!["true", "false"].includes(metadata.authorized)) errors.push("invalid:authorized");
-  if (!["true", "false"].includes(metadata.remote_actions_allowed)) errors.push("invalid:remote_actions_allowed");
-  if (!/^[1-9][0-9]*$/.test(metadata.time_budget_minutes || "")) errors.push("invalid:time_budget_minutes");
-  if (!/^[1-9][0-9]*$/.test(metadata.action_budget || "")) errors.push("invalid:action_budget");
-  if (metadata.authorized === "false" || metadata.remote_actions_allowed === "false") {
-    for (const key of ["target_url", "allowed_hosts", "allowed_http_methods", "allowed_action_kinds"]) {
-      if (metadata[key] !== "none") errors.push(`invalid:local_${key}`);
-    }
-  } else {
-    if (!/^https?:\/\/[^\s]+$/.test(metadata.target_url || "")) errors.push("invalid:target_url");
-    if (!metadata.allowed_hosts || metadata.allowed_hosts === "none") errors.push("missing:allowed_hosts");
-    if (!metadata.allowed_http_methods || metadata.allowed_http_methods === "none") errors.push("missing:allowed_http_methods");
-    if (!metadata.allowed_action_kinds || metadata.allowed_action_kinds === "none") errors.push("missing:allowed_action_kinds");
-  }
+  if (!/^[1-9][0-9]*$/.test(metadata.default_time_budget_minutes || "")) errors.push("invalid:default_time_budget_minutes");
+  if (!/^[1-9][0-9]*$/.test(metadata.maximum_time_budget_minutes || "")) errors.push("invalid:maximum_time_budget_minutes");
+  if (!/^[1-9][0-9]*$/.test(metadata.default_action_budget || "")) errors.push("invalid:default_action_budget");
+  if (!/^[1-9][0-9]*$/.test(metadata.maximum_action_budget || "")) errors.push("invalid:maximum_action_budget");
+  if (Number(metadata.default_time_budget_minutes) > Number(metadata.maximum_time_budget_minutes)) errors.push("invalid:time_budget_policy");
+  if (Number(metadata.default_action_budget) > Number(metadata.maximum_action_budget)) errors.push("invalid:action_budget_policy");
+  if (metadata.per_run_approval_required !== "true") errors.push("invalid:per_run_approval_required");
+  const methods = parseList(metadata.allowed_http_methods);
+  const actionKinds = parseList(metadata.allowed_action_kinds);
+  if (methods.some((method) => !HTTP_METHODS.has(method))) errors.push("invalid:allowed_http_methods");
+  if (actionKinds.some((kind) => !ACTION_KINDS.has(kind))) errors.push("invalid:allowed_action_kinds");
   try {
     validateFlagRegex(metadata.flag_regex);
   } catch {
@@ -191,32 +163,54 @@ function validateFlagRegex(pattern) {
   return compiled;
 }
 
-function normalizeDeclaration(declaration) {
-  const remoteEnabled = declaration.authorized === "true" && declaration.remote_actions_allowed === "true";
-  if (remoteEnabled && (declaration.authorization_state !== "remote-authorized" || declaration.target_state !== "authorized-target" || declaration.remote_status !== "remote-authorized" || declaration.authorized_remote_actions !== "declared-bounded-actions" || declaration.user_approval_record !== "approved")) {
-    throw new Error("Remote execution authorization fields are inconsistent");
-  }
-  if (!remoteEnabled && (declaration.authorized !== "false" || declaration.remote_actions_allowed !== "false")) throw new Error("Execution authorization fields are inconsistent");
-  const flagRegex = validateFlagRegex(declaration.flag_regex);
-  let origin = null;
-  if (remoteEnabled) {
-    const url = new URL(declaration.target_url);
-    if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error("Invalid target origin");
-    origin = `${url.protocol}//${url.host}`;
-  }
-  const methods = parseList(declaration.allowed_http_methods);
-  const actionKinds = parseList(declaration.allowed_action_kinds);
-  if (methods.some((method) => !HTTP_METHODS.has(method))) throw new Error("Invalid allowed HTTP method");
-  if (actionKinds.some((kind) => !ACTION_KINDS.has(kind))) throw new Error("Invalid allowed action kind");
+function loadManifest(challengeSlug) {
+  const manifestPath = process.env.CTFC_STAGE2_MANIFEST;
+  if (!manifestPath || !isAbsolute(manifestPath) || !existsSync(manifestPath) || lstatSync(manifestPath).isSymbolicLink()) throw new Error("Stage 3 manifest is missing or unsafe");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  if (manifest.schema_version !== 1 || manifest.challenge_slug !== challengeSlug || manifest.paths?.manifest !== manifestPath) throw new Error("Stage 3 manifest identity mismatch");
+  if (!manifest.run_id || !manifest.declaration_sha256 || !manifest.target?.origin || !manifest.approval?.approved || !manifest.approval.approved_at) throw new Error("Incomplete Stage 3 manifest");
+  const runRoot = manifest.paths.run_root;
+  const expectedPaths = {
+    manifest: join(runRoot, "run-manifest.json"),
+    lock: join(runRoot, "run.lock"),
+    state: join(runRoot, "execution-state.json"),
+    session: join(runRoot, "session"),
+    cookies: join(runRoot, "session", "cookies.json"),
+    work: join(runRoot, "work"),
+    exploits: join(runRoot, "work", "exploits"),
+    evidence: join(runRoot, "evidence"),
+    private: join(runRoot, "private"),
+    result: join(runRoot, "result.json"),
+  };
+  if (!isAbsolute(runRoot) || !runRoot.endsWith(`/${manifest.run_id}`) || Object.entries(expectedPaths).some(([key, value]) => manifest.paths[key] !== value)) throw new Error("Invalid Stage 3 runtime paths");
+  if (!existsSync(manifest.paths.lock) || lstatSync(manifest.paths.lock).isSymbolicLink()) throw new Error("Run lock is missing or invalid");
+  const manifestBytes = readFileSync(manifestPath);
+  const lockLines = readFileSync(manifest.paths.lock, "utf8").trim().split("\n");
+  if (lockLines.length !== 2 || lockLines[0] !== manifest.run_id || lockLines[1] !== createHash("sha256").update(manifestBytes).digest("hex")) throw new Error("Run lock is missing or invalid");
+  const declaration = readStage2Declaration(challengeSlug);
+  const declarationBytes = readFileSync(declaration.declaration_path || join(declaration.challengeDir, "challenge.md"));
+  if (createHash("sha256").update(declarationBytes).digest("hex") !== manifest.declaration_sha256) throw new Error("Challenge declaration digest mismatch");
+  const target = new URL(manifest.target.origin);
+  if (`${target.protocol}//${target.host}` !== manifest.target.origin || target.pathname !== "/" || target.search || target.hash || target.username || target.password || target.protocol.slice(0, -1) !== manifest.target.protocol || target.hostname !== manifest.target.hostname || Number(target.port || (target.protocol === "https:" ? 443 : 80)) !== manifest.target.port) throw new Error("Invalid manifest target origin");
+  if (declaration.allowed_host_pattern !== "none" && !new RegExp(declaration.allowed_host_pattern).test(target.hostname)) throw new Error("Manifest target host is outside durable policy");
+  const methods = manifest.effective?.http_methods;
+  const actionKinds = manifest.effective?.action_kinds;
+  if (!Array.isArray(methods) || !Array.isArray(actionKinds) || methods.some((method) => !HTTP_METHODS.has(method) || !parseList(declaration.allowed_http_methods).includes(method)) || actionKinds.some((kind) => !ACTION_KINDS.has(kind) || !parseList(declaration.allowed_action_kinds).includes(kind))) throw new Error("Manifest widens durable action policy");
+  const flagRegex = validateFlagRegex(manifest.flag_regex);
+  const budget = manifest.budgets;
+  if (!budget || budget.time_budget_minutes > budget.maximum_time_budget_minutes || budget.action_budget > budget.maximum_action_budget || budget.time_budget_minutes > Number(declaration.maximum_time_budget_minutes) || budget.action_budget > Number(declaration.maximum_action_budget)) throw new Error("Manifest widens durable budget policy");
   return {
     ...declaration,
-    allowedHosts: parseList(declaration.allowed_hosts),
+    ...manifest,
+    allowedHosts: [manifest.target.hostname],
     allowedMethods: methods,
     allowedActionKinds: actionKinds,
-    timeBudgetMinutes: Number(declaration.time_budget_minutes),
-    actionBudget: Number(declaration.action_budget),
+    timeBudgetMinutes: budget.time_budget_minutes,
+    actionBudget: budget.action_budget,
     flagRegex,
-    targetOrigin: origin,
+    targetOrigin: manifest.target.origin,
+    challengeRoot: declaration.challengeDir,
+    runtimePaths: manifest.paths,
   };
 }
 
@@ -229,6 +223,7 @@ function ensureRun() {
   }
   if (activeRun.actionCount >= activeRun.actionBudget) throw new Error("Action budget exhausted");
   activeRun.actionCount += 1;
+  atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ run_id: activeRun.runId, status: activeRun.status, action_count: activeRun.actionCount }, null, 2)}\n`);
   return activeRun;
 }
 
@@ -248,14 +243,24 @@ function rejectSymlinkComponents(root, target) {
   let current = root;
   for (const part of pathFromRoot.split("/")) {
     current = join(current, part);
-    if (!existsSync(current)) break;
-    if (lstatSync(current).isSymbolicLink()) throw new Error("Symlink path component rejected");
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error("Symlink path component rejected");
+    } catch (error) {
+      if (error instanceof Error && error.message === "Symlink path component rejected") throw error;
+      break;
+    }
   }
 }
 
 function ensureSafeDirectory(path, root) {
   rejectSymlinkComponents(root, path);
-  if (existsSync(path) && !lstatSync(path).isDirectory()) throw new Error("Artifact path is not a directory");
+  try {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink()) throw new Error("Symlink path component rejected");
+    if (!info.isDirectory()) throw new Error("Artifact path is not a directory");
+  } catch (error) {
+    if (error instanceof Error && /^(Symlink path component rejected|Artifact path is not a directory)$/.test(error.message)) throw error;
+  }
   mkdirSync(path, { recursive: true });
   rejectSymlinkComponents(root, path);
 }
@@ -270,12 +275,10 @@ function sanitizePreview(value, flagRegex) {
 function writeEvidence(run, entry, privateContent) {
   const sequence = ++run.evidenceSequence;
   const evidenceId = `e-${String(sequence).padStart(3, "0")}`;
-  const artifactsRoot = join(run.challengeRoot, "artifacts");
-  const evidenceDir = join(run.challengeRoot, "artifacts", "evidence");
-  const privateDir = join(run.challengeRoot, "artifacts", "private");
-  ensureSafeDirectory(artifactsRoot, run.challengeRoot);
-  ensureSafeDirectory(evidenceDir, run.challengeRoot);
-  ensureSafeDirectory(privateDir, run.challengeRoot);
+  const evidenceDir = run.runtimePaths.evidence;
+  const privateDir = run.runtimePaths.private;
+  ensureSafeDirectory(evidenceDir, run.runtimePaths.run_root);
+  ensureSafeDirectory(privateDir, run.runtimePaths.run_root);
   const privatePath = join(privateDir, `${sequence}-${evidenceId}.body`);
   const privateBuffer = Buffer.isBuffer(privateContent) ? privateContent : Buffer.from(String(privateContent ?? ""));
   atomicWrite(privatePath, privateBuffer);
@@ -298,7 +301,7 @@ function writeEvidence(run, entry, privateContent) {
 
 function ensureHttpRequest(run, params) {
   if (run.declaration.category !== "web") throw new Error("HTTP requests require Web category");
-  if (run.declaration.authorized !== "true" || run.declaration.remote_actions_allowed !== "true") throw new Error("HTTP requests are not authorized");
+  if (!run.declaration.approval?.approved) throw new Error("HTTP requests are not authorized");
   if (!HTTP_METHODS.has(params.method) || !run.declaration.allowedMethods.includes(params.method)) throw new Error("HTTP method is not allowed");
   if (!ACTION_KINDS.has(params.action_kind) || !run.declaration.allowedActionKinds.includes(params.action_kind)) throw new Error("Action kind is not allowed");
   if (typeof params.path !== "string" || !params.path.startsWith("/") || params.path.startsWith("//") || /[?\\#@\x00\r\n]/.test(params.path)) throw new Error("Unsafe request path");
@@ -351,6 +354,7 @@ function storeCookies(run, response, url) {
     const cookie = parseSetCookie(value, url.hostname);
     if (cookie) run.cookies.set(cookie.name, cookie);
   }
+  writeFileSync(run.runtimePaths.cookies, `${JSON.stringify([...run.cookies.values()], null, 2)}\n`, { mode: 0o600 });
 }
 
 function cookieHeader(run, url) {
@@ -489,12 +493,14 @@ async function executeLocalCommand(params) {
   if (!Object.hasOwn({ file: 1, strings: 1, readelf: 1, objdump: 1, nm: 1, sha256: 1, run_exploit: 1 }, profile)) throw new Error("Invalid command profile");
   if (profile === "run_exploit" && process.env.CTFC_STAGE2_TEST_MODE !== TEST_MODE) throw new Error("run_exploit is test-mode-only");
   const sourceRoot = realpathSync(join(run.challengeRoot, "source"));
-  const artifactsRoot = realpathSync(join(run.challengeRoot, "artifacts"));
-  const exploitsRoot = realpathSync(join(run.challengeRoot, "exploits"));
-  const roots = profile === "run_exploit" ? [exploitsRoot] : [sourceRoot, artifactsRoot];
+  const workRoot = realpathSync(run.runtimePaths.work);
+  const exploitsRoot = realpathSync(run.runtimePaths.exploits);
+  const roots = profile === "run_exploit" ? [exploitsRoot] : [sourceRoot, workRoot];
   const paths = params.paths ?? [];
   if (paths.length === 0 || paths.length > 8) throw new Error("Invalid command paths");
-  const resolvedPaths = paths.map((path) => safeRelativePath(run, path, roots));
+  const resolvedPaths = profile === "run_exploit"
+    ? paths.map((path) => safeRelativePath({ ...run, challengeRoot: exploitsRoot }, path.replace(/^exploits\//, ""), roots))
+    : paths.map((path) => safeRelativePath(run, path, roots));
   if (profile === "run_exploit") {
     if (resolvedPaths.length !== 1 || !resolvedPaths[0].endsWith(".py")) throw new Error("run_exploit requires one Python file");
     const relativeExploit = relative(run.challengeRoot, resolvedPaths[0]);
@@ -523,7 +529,7 @@ async function executeLocalCommand(params) {
 
 function ensureExploitPath(run, relativePath) {
   if (typeof relativePath !== "string" || !relativePath.endsWith(".py") || isAbsolute(relativePath) || relativePath.includes("\\") || relativePath.includes("\x00") || relativePath.split("/").some((part) => part === "..")) throw new Error("Unsafe exploit path");
-  const root = realpathSync(join(run.challengeRoot, "exploits"));
+  const root = realpathSync(run.runtimePaths.exploits);
   const target = resolve(root, relativePath);
   if (!isInside(root, target)) throw new Error("Exploit path escapes challenge");
   rejectSymlinkComponents(root, target);
@@ -536,7 +542,7 @@ function writeExploit(params) {
   if (params.language !== "python") throw new Error("Only Python exploits are supported");
   if (typeof params.content !== "string" || Buffer.byteLength(params.content) > 64 * 1024) throw new Error("Exploit content exceeds limit");
   const target = ensureExploitPath(run, params.relative_path);
-  mkdirSync(join(run.challengeRoot, "exploits"), { recursive: true });
+  ensureSafeDirectory(run.runtimePaths.exploits, run.runtimePaths.work);
   const descriptor = openSync(target, "wx", 0o600);
   try { writeFileSync(descriptor, params.content, { mode: 0o600 }); } finally { closeSync(descriptor); }
   const relativePath = relative(run.challengeRoot, target);
@@ -548,9 +554,9 @@ function verifyFlag(params) {
   if (!activeRun || !["active"].includes(activeRun.status)) throw new Error("No verifiable active investigation");
   const evidence = activeRun.evidenceRecords.get(params.evidence_id);
   if (!evidence) throw new Error("Evidence does not belong to current run");
-  const publicPath = join(activeRun.challengeRoot, "artifacts", "evidence", `${evidence.record.sequence}-${params.evidence_id}.json`);
-  rejectSymlinkComponents(join(activeRun.challengeRoot, "artifacts"), publicPath);
-  rejectSymlinkComponents(join(activeRun.challengeRoot, "artifacts"), evidence.privatePath);
+  const publicPath = join(activeRun.runtimePaths.evidence, `${evidence.record.sequence}-${params.evidence_id}.json`);
+  rejectSymlinkComponents(activeRun.runtimePaths.run_root, publicPath);
+  rejectSymlinkComponents(activeRun.runtimePaths.run_root, evidence.privatePath);
   const publicRecord = JSON.parse(readFileSync(publicPath, "utf8"));
   const privateBytes = readFileSync(evidence.privatePath);
   const { evidence_hash: publicHash, ...publicBase } = publicRecord;
@@ -576,21 +582,23 @@ function finalizeResult(params) {
   if (params.status === "solved" && !verification) throw new Error("Solved requires verified evidence");
   activeRun.status = params.status;
   const result = { status: params.status, reason: String(params.reason).slice(0, 500), run_id: activeRun.runId, challenge_slug: activeRun.challengeSlug, action_count: activeRun.actionCount, elapsed_ms: Date.now() - activeRun.startedAt, verified_evidence_id: params.verified_evidence_id ?? null, flag_sha256: verification?.flag_sha256 ?? null, finalized_at: new Date().toISOString() };
-  atomicWrite(join(activeRun.challengeRoot, "artifacts", "result.json"), `${JSON.stringify(result, null, 2)}\n`);
+  atomicWrite(activeRun.runtimePaths.result, `${JSON.stringify(result, null, 2)}\n`);
+  atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ ...result, action_count: activeRun.actionCount }, null, 2)}\n`);
   return result;
 }
 
 export function beginInvestigation(challengeSlug) {
   if (activeRun?.status === "active") throw new Error("An investigation is already active");
-  const declaration = normalizeDeclaration(readStage2Declaration(challengeSlug, { execution: true }));
-  const challengeRoot = declaration.challengeDir;
+  const declaration = loadManifest(challengeSlug);
+  const challengeRoot = declaration.challengeRoot;
   activeRun = {
-    runId: randomUUID(), status: "active", challengeSlug, challengeRoot, declaration,
-    normalizedTargetOrigin: declaration.targetOrigin, startedAt: Date.now(), deadlineAt: Date.now() + declaration.timeBudgetMinutes * 60 * 1000,
+    runId: declaration.run_id, status: "active", challengeSlug, challengeRoot, declaration,
+    runtimePaths: declaration.runtimePaths, normalizedTargetOrigin: declaration.targetOrigin, startedAt: Date.now(), deadlineAt: Date.parse(declaration.deadline_at),
     actionBudget: declaration.actionBudget, actionCount: 0, evidenceSequence: 0, lastEvidenceHash: null,
     cookies: new Map(), writtenExploitFiles: new Map(), verifiedFlags: new Map(), evidenceRecords: new Map(), consecutiveNoNewEvidence: 0,
   };
-  return { challenge_slug: challengeSlug, state: "ready", phase: "source_audit", category: declaration.category, next_action: "delegate_one_read_only_auditor", remote_actions: declaration.authorized === "true" && declaration.remote_actions_allowed === "true" ? "allowed_by_declaration" : "blocked", side_effects: "none" };
+  atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ run_id: activeRun.runId, status: activeRun.status, action_count: 0 }, null, 2)}\n`);
+  return { challenge_slug: challengeSlug, state: "ready", phase: "source_audit", category: declaration.category, next_action: "delegate_one_read_only_auditor", remote_actions: "allowed_by_manifest", side_effects: "none", run_id: declaration.run_id };
 }
 
 function textResult(value) { return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }; }
@@ -600,7 +608,7 @@ const stage2Status = defineTool({
   parameters: Type.Object({ challenge_slug: Type.String({ description: "Safe challenge directory slug" }) }),
   async execute(_id, params) {
     const declaration = readStage2Declaration(params.challenge_slug);
-    return textResult({ challenge_slug: declaration.challenge_slug, category: declaration.category, authorization_state: declaration.authorization_state, remote_actions_state: declaration.authorized_remote_actions, time_budget: declaration.time_budget });
+    return textResult({ challenge_slug: declaration.challenge_slug, category: declaration.category, methods: parseList(declaration.allowed_http_methods), action_kinds: parseList(declaration.allowed_action_kinds), per_run_approval_required: declaration.per_run_approval_required, time_budget: declaration.time_budget });
   },
 });
 

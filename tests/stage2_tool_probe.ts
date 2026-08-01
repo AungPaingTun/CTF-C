@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { beginInvestigation, isValidChallengeSlug, readStage2Declaration } from "../.pi/extensions/ctf-c-stage2-core.mjs";
+import { createStage3Manifest } from "../scripts/create_stage3_manifest.mjs";
 
 function assertChallengeSymlinkIsRejected(): void {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "ctf-c-stage2-probe-"));
@@ -44,13 +45,21 @@ export default function (pi: ExtensionAPI) {
     cpSync(join(process.cwd(), "tests", "fixtures", "web-source-audit"), fixturePath, { recursive: true });
     try {
       const status = readStage2Declaration(fixtureSlug);
-      if (status.category !== "web" || status.authorization_state !== "local-only" || status.authorized_remote_actions !== "none" || status.time_budget !== "15 minutes") {
+      if (status.category !== "web" || status.default_time_budget_minutes !== "15" || status.per_run_approval_required !== "true") {
         throw new Error("stage2 status metadata mismatch");
       }
       process.stderr.write("CTF_C_STATUS=metadata-read\n");
-      const skeleton = beginInvestigation(fixtureSlug);
-      if (skeleton.state !== "ready" || skeleton.phase !== "source_audit" || skeleton.side_effects !== "none") {
-        throw new Error("begin investigation skeleton mismatch");
+      const runtimeRoot = mkdtempSync(join(tmpdir(), "ctf-c-stage2-restricted-runtime-"));
+      try {
+        const manifest = createStage3Manifest({ projectRoot: process.cwd(), slug: fixtureSlug, target: "http://127.0.0.1:18080/", approved: true, runtimeRoot });
+        process.env.CTFC_STAGE2_MANIFEST = manifest.paths.manifest;
+        const skeleton = beginInvestigation(fixtureSlug);
+        if (skeleton.state !== "ready" || skeleton.phase !== "source_audit" || skeleton.side_effects !== "none") {
+          throw new Error("begin investigation skeleton mismatch");
+        }
+      } finally {
+        delete process.env.CTFC_STAGE2_MANIFEST;
+        rmSync(runtimeRoot, { recursive: true, force: true });
       }
     } finally {
       rmSync(fixturePath, { recursive: true, force: true });

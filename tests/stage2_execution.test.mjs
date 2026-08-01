@@ -1,8 +1,9 @@
 import { createServer } from "node:http";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stage2Tools, beginInvestigation } from "../.pi/extensions/ctf-c-stage2-core.mjs";
+import { createStage3Manifest } from "../scripts/create_stage3_manifest.mjs";
 
 function tool(name) {
   const selected = stage2Tools.find((candidate) => candidate.name === name);
@@ -20,13 +21,14 @@ function assert(condition, message) {
 }
 
 async function expectReject(action, pattern, message) {
+  let result;
   try {
-    await action();
+    result = await action();
   } catch (error) {
-    assert(error instanceof Error && pattern.test(error.message), message);
+    assert(error instanceof Error && pattern.test(error.message), `${message}: ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
-  throw new Error(`${message}: operation succeeded`);
+  throw new Error(`${message}: operation succeeded ${JSON.stringify(result)}`);
 }
 
 export default function (pi) {
@@ -60,22 +62,25 @@ export default function (pi) {
     const fixtureRoot = join(process.cwd(), "tests", "fixtures", "stage2-web");
     mkdirSync(join(process.cwd(), "challenges"), { recursive: true });
     cpSync(fixtureRoot, challengeRoot, { recursive: true });
-    const declarationPath = join(challengeRoot, "challenge.md");
-    writeFileSync(declarationPath, readFileSync(declarationPath, "utf8").replace("__PORT__", String(address.port)));
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "ctf-c-stage2-runtime-"));
+    const manifest = createStage3Manifest({ projectRoot: process.cwd(), slug, target: `http://127.0.0.1:${address.port}/`, approved: true, runtimeRoot });
+    process.env.CTFC_STAGE2_MANIFEST = manifest.paths.manifest;
     let outsideRoot = null;
 
     try {
       const started = beginInvestigation(slug);
-      assert(started.state === "ready" && started.remote_actions === "allowed_by_declaration", "investigation did not start as declared");
-      const evidenceDir = join(challengeRoot, "artifacts", "evidence");
+      assert(started.state === "ready" && started.remote_actions === "allowed_by_manifest", "investigation did not start as declared");
+      const evidenceDir = manifest.paths.evidence;
       outsideRoot = mkdtempSync(join(tmpdir(), "ctf-c-stage2-outside-"));
+      rmSync(evidenceDir, { recursive: true, force: true });
       symlinkSync(outsideRoot, evidenceDir);
+      assert(lstatSync(evidenceDir).isSymbolicLink(), "evidence symlink fixture was not created");
       await expectReject(
         () => call("http_request", { hypothesis_id: "symlink-evidence", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 }),
         /Symlink path component rejected/,
         "symlinked evidence directory was accepted",
       );
-      rmSync(evidenceDir, { recursive: true, force: true });
+      unlinkSync(evidenceDir);
       mkdirSync(evidenceDir);
       const login = await call("http_request", { hypothesis_id: "login", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 });
       assert(login.status_code === 200 && login.evidence_id, "login request failed");
@@ -84,14 +89,14 @@ export default function (pi) {
       assert(query.preview.match(/\[REDACTED_FLAG\]/g)?.length === 2, "multiple flags were not redacted");
       for (const secret of ["session=abc123", "csrf-secret", "top-secret", "auth-secret", "json-secret", "json-csrf", "json-session"]) assert(!query.preview.includes(secret), `public preview leaked ${secret}`);
       const querySequence = Number(query.evidence_id.slice(2));
-      const queryPublicPath = join(challengeRoot, "artifacts", "evidence", `${querySequence}-${query.evidence_id}.json`);
+      const queryPublicPath = join(manifest.paths.evidence, `${querySequence}-${query.evidence_id}.json`);
       const queryPublicOriginal = readFileSync(queryPublicPath);
       const queryPublicRecord = JSON.parse(queryPublicOriginal.toString("utf8"));
       queryPublicRecord.preview = "tampered";
       writeFileSync(queryPublicPath, `${JSON.stringify(queryPublicRecord)}\n`);
       await expectReject(() => call("verify_flag", { evidence_id: query.evidence_id }), /Evidence integrity check failed|Evidence record changed/, "tampered public evidence was accepted");
       writeFileSync(queryPublicPath, queryPublicOriginal);
-      const queryPrivatePath = join(challengeRoot, "artifacts", "private", `${querySequence}-${query.evidence_id}.body`);
+      const queryPrivatePath = join(manifest.paths.private, `${querySequence}-${query.evidence_id}.body`);
       const queryPrivateOriginal = readFileSync(queryPrivatePath);
       writeFileSync(queryPrivatePath, "tampered private artifact");
       await expectReject(() => call("verify_flag", { evidence_id: query.evidence_id }), /Evidence integrity check failed/, "tampered private evidence was accepted");
@@ -112,21 +117,21 @@ export default function (pi) {
       symlinkSync(outsideRoot, sourceEscape);
       await expectReject(
         () => call("run_local_command", { hypothesis_id: "symlink-source", profile: "sha256", paths: ["source/escape/missing.js"], timeout_ms: 2000 }),
-        /Symlink path component rejected|Path escapes allowed root/,
+        /Symlink path component rejected|Path escapes allowed root|Path escapes challenge directory/,
         "symlinked source parent was accepted",
       );
-      rmSync(sourceEscape, { recursive: true, force: true });
-      const exploitEscape = join(challengeRoot, "exploits", "escape");
+      unlinkSync(sourceEscape);
+      const exploitEscape = join(manifest.paths.exploits, "escape");
       rmSync(exploitEscape, { recursive: true, force: true });
       symlinkSync(outsideRoot, exploitEscape);
       await expectReject(
         () => call("write_exploit", { hypothesis_id: "symlink-exploit", relative_path: "escape/payload.py", language: "python", content: "print('no')\n" }),
-        /Symlink path component rejected|Path escapes allowed root/,
+        /Symlink path component rejected|Path escapes allowed root|Path escapes challenge directory/,
         "symlinked exploit parent was accepted",
       );
-      rmSync(exploitEscape, { recursive: true, force: true });
+      unlinkSync(exploitEscape);
       const exploit = await call("write_exploit", { hypothesis_id: "exploit", relative_path: "fixture.py", language: "python", content: "print('picoCTF{stage2_exploit_fixture}')\n" });
-      const exploitRun = await call("run_local_command", { hypothesis_id: "exploit-run", profile: "run_exploit", paths: ["exploits/fixture.py"], timeout_ms: 2000 });
+      const exploitRun = await call("run_local_command", { hypothesis_id: "exploit-run", profile: "run_exploit", paths: ["fixture.py"], timeout_ms: 2000 });
       assert(exploit.evidence_id && exploitRun.outcome === "completed", "test exploit execution failed");
       const exploitEvidence = await call("verify_flag", { evidence_id: exploitRun.evidence_id });
       try {
@@ -141,7 +146,9 @@ export default function (pi) {
     } finally {
       server.close();
       rmSync(challengeRoot, { recursive: true, force: true });
+      rmSync(runtimeRoot, { recursive: true, force: true });
       if (outsideRoot) rmSync(outsideRoot, { recursive: true, force: true });
+      delete process.env.CTFC_STAGE2_MANIFEST;
     }
   });
 }
