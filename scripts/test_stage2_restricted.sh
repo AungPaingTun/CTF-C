@@ -16,12 +16,13 @@ tool_line=$(grep '^CTF_C_TOOL_LIST=' "$stderr_file")
 grep -q '^CTF_C_INVALID_SLUGS=rejected$' "$stderr_file"
 grep -q '^CTF_C_SYMLINKS=rejected$' "$stderr_file"
 grep -q '^CTF_C_STATUS=metadata-read$' "$stderr_file"
+grep -q '^CTF_C_INVESTIGATION=ready$' "$stderr_file"
 printf '%s\n' "$tool_line" | node -e '
 let input = "";
 process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
   const tools = JSON.parse(input.trim().slice("CTF_C_TOOL_LIST=".length));
-  const allowed = ["Agent", "get_subagent_result", "stage2_status", "steer_subagent"];
+  const allowed = ["Agent", "begin_investigation", "get_subagent_result", "stage2_status", "steer_subagent"];
   if (!allowed.every((name) => tools.includes(name))) process.exit(1);
   if (tools.filter((name) => name === "stage2_status").length !== 1) process.exit(1);
   if (tools.some((name) => !allowed.includes(name))) process.exit(1);
@@ -44,7 +45,7 @@ grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/binary_auditor.md"
 grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/reviewer.md"
 ! grep -q 'stage2_status' "$project_root/.pi/agents/source_auditor.md" "$project_root/.pi/agents/web_auditor.md" "$project_root/.pi/agents/binary_auditor.md" "$project_root/.pi/agents/reviewer.md"
 
-if grep -Eq '(^|[[:space:]])(curl|wget|nc|ssh)([[:space:]]|$)' "$project_root/.pi/extensions/ctf-c-stage2.ts"; then
+if grep -Eq '(^|[[:space:]])(curl|wget|nc|ssh)([[:space:]]|$)' "$project_root/.pi/extensions/ctf-c-stage2-core.mjs"; then
   printf 'network utility found in stage2 extension\n' >&2
   exit 1
 fi

@@ -1,0 +1,8 @@
+{
+  "packages": [
+    "git:github.com/tintinweb/pi-subagents#2966cd5a33c0640de9698b56a39c11f83207a835"
+  ],
+  "extensions": [
+    "extensions/ctf-c-stage2-core.mjs"
+  ]
+}
