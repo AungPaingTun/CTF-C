@@ -90,7 +90,8 @@ export default function (pi) {
 
       const started = beginInvestigation(slug);
       assert(started.run_id === manifestA.run_id && started.remote_actions === "allowed_by_manifest", "manifest run was not initialized");
-      const command = await call("run_local_command", { hypothesis_id: "runtime-path", profile: "sha256", paths: ["source/app.js"], timeout_ms: 2000 });
+      await call("record_hypotheses", { hypotheses: [{ id: "H1", rank: 1, confidence: 0.8, statement: "The fixture source supports a bounded local proof.", evidence_refs: ["tests/fixtures/stage2-web/source/app.js"] }] });
+      const command = await call("run_local_command", { hypothesis_id: "H1", profile: "sha256", paths: ["source/app.js"], timeout_ms: 2000 });
       assert(command.evidence_id && readdirSync(manifestA.paths.evidence).length > 0, "evidence was not written under runtime directory");
       assert(!existsSync(join(challengeRoot, "artifacts", "evidence")), "evidence was written under challenge directory");
       await call("finalize_result", { status: "not_solved", reason: "runtime path test" });

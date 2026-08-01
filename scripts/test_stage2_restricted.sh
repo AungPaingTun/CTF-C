@@ -22,7 +22,7 @@ let input = "";
 process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
   const tools = JSON.parse(input.trim().slice("CTF_C_TOOL_LIST=".length));
-  const allowed = ["Agent", "begin_investigation", "finalize_result", "get_subagent_result", "http_request", "run_local_command", "stage2_status", "steer_subagent", "verify_flag", "write_exploit"];
+  const allowed = ["Agent", "begin_investigation", "finalize_result", "get_subagent_result", "http_request", "record_hypotheses", "run_local_command", "stage2_status", "steer_subagent", "verify_flag", "write_exploit"];
   if (!allowed.every((name) => tools.includes(name))) process.exit(1);
   if (tools.filter((name) => name === "stage2_status").length !== 1) process.exit(1);
   if (tools.some((name) => !allowed.includes(name))) process.exit(1);
@@ -43,7 +43,7 @@ grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/source_auditor.md"
 grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/web_auditor.md"
 grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/binary_auditor.md"
 grep -q '^allowed_subagents: none$' "$project_root/.pi/agents/reviewer.md"
-! grep -q 'stage2_status' "$project_root/.pi/agents/source_auditor.md" "$project_root/.pi/agents/web_auditor.md" "$project_root/.pi/agents/binary_auditor.md" "$project_root/.pi/agents/reviewer.md"
+! grep -Eq 'stage2_status|begin_investigation|record_hypotheses|http_request|run_local_command|write_exploit|verify_flag|finalize_result' "$project_root/.pi/agents/source_auditor.md" "$project_root/.pi/agents/web_auditor.md" "$project_root/.pi/agents/binary_auditor.md" "$project_root/.pi/agents/reviewer.md"
 
 if grep -Eq '(^|[[:space:]])(curl|wget|nc|ssh)([[:space:]]|$)' "$project_root/.pi/extensions/ctf-c-stage2-core.mjs"; then
   printf 'network utility found in stage2 extension\n' >&2

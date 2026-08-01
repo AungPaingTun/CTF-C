@@ -1,0 +1,9 @@
+{
+  "maxConcurrent": 1,
+  "maxSubagentDepth": 1,
+  "maxDepth": 1,
+  "schedulingEnabled": false,
+  "disableDefaultAgents": true,
+  "outputTranscript": false,
+  "fallbackSubagent": "none"
+}

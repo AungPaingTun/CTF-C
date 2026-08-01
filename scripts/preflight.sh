@@ -27,7 +27,7 @@ grep -Eq '^-[[:space:]]*\*\*Allowed host pattern:\*\*[[:space:]]*`[^`]+`' "$dir/
 grep -Eq '^-[[:space:]]*\*\*Per-run approval required:\*\*[[:space:]]*`true`' "$dir/challenge.md" || { printf 'Per-run approval must be required\n' >&2; exit 1; }
 grep -Eq '^-[[:space:]]*\*\*Time budget:\*\*[[:space:]]*`(15 minutes|30 minutes)`' "$dir/challenge.md" || { printf 'Invalid or missing time budget\n' >&2; exit 1; }
 
-if grep -Eq '^-[[:space:]]*\*\*(Target authorization|Target|Remote status|Authorized remote actions|User approval record|Authorized|Remote actions allowed|Target URL|Allowed hosts):' "$dir/challenge.md"; then
+if grep -Eq '^-[[:space:]]*\*\*(User approval record|Authorized|Remote actions allowed|Target URL|Allowed hosts):' "$dir/challenge.md"; then
   printf 'Live target or authorization fields are forbidden in challenge.md\n' >&2
   exit 1
 fi

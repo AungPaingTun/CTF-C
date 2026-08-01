@@ -50,6 +50,7 @@ const MAX_PREVIEW_BYTES = 1024;
 const MIN_TIMEOUT_MS = 250;
 const MAX_TIMEOUT_MS = 10000;
 const TEST_MODE = "local-fixture";
+const HYPOTHESIS_ID = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 
 let activeRun = null;
 
@@ -222,9 +223,45 @@ function ensureRun() {
     throw new Error("Investigation deadline exceeded");
   }
   if (activeRun.actionCount >= activeRun.actionBudget) throw new Error("Action budget exhausted");
+  if (activeRun.consecutiveNoNewEvidence >= 3) throw new Error("Three consecutive actions produced no new evidence");
   activeRun.actionCount += 1;
   atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ run_id: activeRun.runId, status: activeRun.status, action_count: activeRun.actionCount }, null, 2)}\n`);
   return activeRun;
+}
+
+function requireHypothesis(run, hypothesisId) {
+  if (typeof hypothesisId !== "string" || !run.hypotheses.has(hypothesisId)) throw new Error("Unknown or unrecorded hypothesis");
+  return run.hypotheses.get(hypothesisId);
+}
+
+function validateHypotheses(run, hypotheses) {
+  if (!Array.isArray(hypotheses) || hypotheses.length < 1 || hypotheses.length > 3) throw new Error("Hypotheses must contain one to three entries");
+  const ids = new Set();
+  const ranks = new Set();
+  return hypotheses.map((hypothesis) => {
+    if (!hypothesis || typeof hypothesis !== "object" || !HYPOTHESIS_ID.test(hypothesis.id) || ids.has(hypothesis.id)) throw new Error("Hypothesis IDs must be unique and well formed");
+    if (![1, 2, 3].includes(hypothesis.rank) || ranks.has(hypothesis.rank)) throw new Error("Hypothesis ranks must be unique values from one to three");
+    if (typeof hypothesis.confidence !== "number" || !Number.isFinite(hypothesis.confidence) || hypothesis.confidence < 0 || hypothesis.confidence > 1) throw new Error("Hypothesis confidence must be between zero and one");
+    if (typeof hypothesis.statement !== "string" || !hypothesis.statement.trim() || hypothesis.statement.length > 1000) throw new Error("Hypothesis statement is required");
+    if (!Array.isArray(hypothesis.evidence_refs) || hypothesis.evidence_refs.length < 1 || hypothesis.evidence_refs.some((ref) => typeof ref !== "string" || !ref.trim() || ref.length > 256)) throw new Error("Hypotheses require local evidence references");
+    for (const ref of hypothesis.evidence_refs) if (/^e-\d+$/.test(ref) && !run.evidenceRecords.has(ref)) throw new Error("Unknown execution evidence reference");
+    if (hypothesis.local_test !== undefined && (typeof hypothesis.local_test !== "string" || hypothesis.local_test.length > 1000)) throw new Error("Invalid local hypothesis test");
+    if (hypothesis.proposed_remote_action !== undefined) {
+      const action = hypothesis.proposed_remote_action;
+      if (!ACTION_KINDS.has(action.action_kind) || (action.method !== undefined && !HTTP_METHODS.has(action.method)) || (action.path !== undefined && (typeof action.path !== "string" || !action.path.startsWith("/")))) throw new Error("Invalid proposed action");
+    }
+    ids.add(hypothesis.id);
+    ranks.add(hypothesis.rank);
+    return { ...hypothesis, evidence_refs: [...hypothesis.evidence_refs] };
+  });
+}
+
+function recordHypotheses(params) {
+  if (!activeRun || activeRun.status !== "active") throw new Error("No active investigation");
+  const validated = validateHypotheses(activeRun, params.hypotheses);
+  activeRun.hypothesisRevision += 1;
+  for (const hypothesis of validated) activeRun.hypotheses.set(hypothesis.id, { ...hypothesis, revision: activeRun.hypothesisRevision });
+  return { recorded: true, revision: activeRun.hypothesisRevision, hypotheses: validated };
 }
 
 function hashBuffer(value) {
@@ -296,6 +333,8 @@ function writeEvidence(run, entry, privateContent) {
   atomicWrite(join(evidenceDir, `${sequence}-${evidenceId}.json`), `${JSON.stringify(record, null, 2)}\n`);
   run.lastEvidenceHash = evidenceHash;
   run.evidenceRecords.set(evidenceId, { record, privatePath });
+  if ((entry.bytes ?? 0) > 0 || entry.outcome === "completed") run.consecutiveNoNewEvidence = 0;
+  else run.consecutiveNoNewEvidence += 1;
   return { evidence_id: evidenceId, outcome: entry.outcome, status_code: entry.status_code ?? null, duration_ms: entry.duration_ms ?? null, response_bytes: entry.bytes ?? null, redirect_location_present: Boolean(entry.redirect_location_present), preview: entry.preview ?? "" };
 }
 
@@ -385,6 +424,8 @@ async function readResponseBody(response, limit, signal) {
 }
 
 async function executeHttpRequest(params) {
+  if (!activeRun) throw new Error("No active investigation");
+  requireHypothesis(activeRun, params.hypothesis_id);
   const run = ensureRun();
   const request = ensureHttpRequest(run, params);
   const started = Date.now();
@@ -486,6 +527,8 @@ function spawnBounded(executable, args, cwd, timeout) {
 }
 
 async function executeLocalCommand(params) {
+  if (!activeRun) throw new Error("No active investigation");
+  requireHypothesis(activeRun, params.hypothesis_id);
   const run = ensureRun();
   const timeout = Number(params.timeout_ms);
   if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT_MS || timeout > MAX_TIMEOUT_MS) throw new Error("Invalid timeout");
@@ -538,6 +581,8 @@ function ensureExploitPath(run, relativePath) {
 }
 
 function writeExploit(params) {
+  if (!activeRun) throw new Error("No active investigation");
+  requireHypothesis(activeRun, params.hypothesis_id);
   const run = ensureRun();
   if (params.language !== "python") throw new Error("Only Python exploits are supported");
   if (typeof params.content !== "string" || Buffer.byteLength(params.content) > 64 * 1024) throw new Error("Exploit content exceeds limit");
@@ -595,7 +640,7 @@ export function beginInvestigation(challengeSlug) {
     runId: declaration.run_id, status: "active", challengeSlug, challengeRoot, declaration,
     runtimePaths: declaration.runtimePaths, normalizedTargetOrigin: declaration.targetOrigin, startedAt: Date.now(), deadlineAt: Date.parse(declaration.deadline_at),
     actionBudget: declaration.actionBudget, actionCount: 0, evidenceSequence: 0, lastEvidenceHash: null,
-    cookies: new Map(), writtenExploitFiles: new Map(), verifiedFlags: new Map(), evidenceRecords: new Map(), consecutiveNoNewEvidence: 0,
+    cookies: new Map(), writtenExploitFiles: new Map(), verifiedFlags: new Map(), evidenceRecords: new Map(), consecutiveNoNewEvidence: 0, hypotheses: new Map(), hypothesisRevision: 0,
   };
   atomicWrite(activeRun.runtimePaths.state, `${JSON.stringify({ run_id: activeRun.runId, status: activeRun.status, action_count: 0 }, null, 2)}\n`);
   return { challenge_slug: challengeSlug, state: "ready", phase: "source_audit", category: declaration.category, next_action: "delegate_one_read_only_auditor", remote_actions: "allowed_by_manifest", side_effects: "none", run_id: declaration.run_id };
@@ -616,6 +661,12 @@ const beginInvestigationTool = defineTool({
   name: "begin_investigation", label: "Begin Investigation", description: "Start one bounded CTF-C investigation without side effects.",
   parameters: Type.Object({ challenge_slug: Type.String({ description: "Safe challenge directory slug" }) }),
   async execute(_id, params) { return textResult(beginInvestigation(params.challenge_slug)); },
+});
+
+const recordHypothesesTool = defineTool({
+  name: "record_hypotheses", label: "Record Hypotheses", description: "Validate and retain up to three local-source hypotheses before execution.",
+  parameters: Type.Object({ hypotheses: Type.Array(Type.Object({ id: Type.String(), rank: Type.Number(), confidence: Type.Number(), statement: Type.String(), evidence_refs: Type.Array(Type.String()), local_test: Type.Optional(Type.String()), proposed_remote_action: Type.Optional(Type.Object({ action_kind: Type.String(), method: Type.Optional(Type.Union([Type.Literal("GET"), Type.Literal("POST")])), path: Type.Optional(Type.String()) })) })) }),
+  async execute(_id, params) { return textResult(recordHypotheses(params)); },
 });
 
 const httpRequestTool = defineTool({
@@ -648,7 +699,7 @@ const finalizeResultTool = defineTool({
   async execute(_id, params) { return textResult(finalizeResult(params)); },
 });
 
-export const stage2Tools = [stage2Status, beginInvestigationTool, httpRequestTool, localCommandTool, writeExploitTool, verifyFlagTool, finalizeResultTool];
+export const stage2Tools = [stage2Status, beginInvestigationTool, recordHypothesesTool, httpRequestTool, localCommandTool, writeExploitTool, verifyFlagTool, finalizeResultTool];
 
 export default function (pi) {
   for (const tool of stage2Tools) pi.registerTool(tool);

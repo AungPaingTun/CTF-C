@@ -35,4 +35,5 @@ fi
 [ "$approved" = true ] || { printf 'Explicit --approve is required with --target\n' >&2; exit 1; }
 manifest_path=$(node "$script_dir/create_stage3_manifest.mjs" "$project_root" "$slug" "$target" approved "$runtime_root")
 printf 'Stage 3 manifest: %s\n' "$manifest_path"
-exec env CTFC_STAGE2_MANIFEST="$manifest_path" pi --no-builtin-tools --offline --no-session --approve
+coordinator_contract='Call begin_investigation first. Follow its route, run exactly one foreground read-only auditor, require strict JSON, call record_hypotheses before one typed action at a time, re-evaluate after each result, verify_flag before solved, finalize every terminal state, and stop after finalization. Use no built-in tools, parallelism, background scheduling, or invented IDs.'
+exec env CTFC_STAGE2_MANIFEST="$manifest_path" pi --no-builtin-tools --offline --no-session --approve "$coordinator_contract"

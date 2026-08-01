@@ -70,21 +70,22 @@ export default function (pi) {
     try {
       const started = beginInvestigation(slug);
       assert(started.state === "ready" && started.remote_actions === "allowed_by_manifest", "investigation did not start as declared");
+      await call("record_hypotheses", { hypotheses: [{ id: "H1", rank: 1, confidence: 0.9, statement: "The local fixture exposes the flag through a bounded request flow.", evidence_refs: ["tests/fixtures/stage2-web/source/app.js"], local_test: "Inspect the deterministic fixture response flow." }] });
       const evidenceDir = manifest.paths.evidence;
       outsideRoot = mkdtempSync(join(tmpdir(), "ctf-c-stage2-outside-"));
       rmSync(evidenceDir, { recursive: true, force: true });
       symlinkSync(outsideRoot, evidenceDir);
       assert(lstatSync(evidenceDir).isSymbolicLink(), "evidence symlink fixture was not created");
       await expectReject(
-        () => call("http_request", { hypothesis_id: "symlink-evidence", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 }),
+        () => call("http_request", { hypothesis_id: "H1", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 }),
         /Symlink path component rejected/,
         "symlinked evidence directory was accepted",
       );
       unlinkSync(evidenceDir);
       mkdirSync(evidenceDir);
-      const login = await call("http_request", { hypothesis_id: "login", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 });
+      const login = await call("http_request", { hypothesis_id: "H1", method: "POST", path: "/login", form: { user: "fixture" }, action_kind: "login", timeout_ms: 2000 });
       assert(login.status_code === 200 && login.evidence_id, "login request failed");
-      const query = await call("http_request", { hypothesis_id: "query", method: "GET", path: "/query", query: { q: "stage2" }, action_kind: "recon", timeout_ms: 2000 });
+      const query = await call("http_request", { hypothesis_id: "H1", method: "GET", path: "/query", query: { q: "stage2" }, action_kind: "recon", timeout_ms: 2000 });
       assert(query.status_code === 200, "query request failed");
       assert(query.preview.match(/\[REDACTED_FLAG\]/g)?.length === 2, "multiple flags were not redacted");
       for (const secret of ["session=abc123", "csrf-secret", "top-secret", "auth-secret", "json-secret", "json-csrf", "json-session"]) assert(!query.preview.includes(secret), `public preview leaked ${secret}`);
@@ -101,7 +102,7 @@ export default function (pi) {
       writeFileSync(queryPrivatePath, "tampered private artifact");
       await expectReject(() => call("verify_flag", { evidence_id: query.evidence_id }), /Evidence integrity check failed/, "tampered private evidence was accepted");
       writeFileSync(queryPrivatePath, queryPrivateOriginal);
-      const flagResponse = await call("http_request", { hypothesis_id: "flag", method: "GET", path: "/flag", action_kind: "authenticated_request", timeout_ms: 2000 });
+      const flagResponse = await call("http_request", { hypothesis_id: "H1", method: "GET", path: "/flag", action_kind: "authenticated_request", timeout_ms: 2000 });
       assert(flagResponse.status_code === 200 && flagResponse.preview.includes("REDACTED_FLAG"), "cookie or redaction behavior failed");
       await expectReject(
         () => call("finalize_result", { status: "solved", reason: "unverified", verified_evidence_id: flagResponse.evidence_id }),
@@ -110,13 +111,13 @@ export default function (pi) {
       );
       const verified = await call("verify_flag", { evidence_id: flagResponse.evidence_id });
       assert(verified.verified === true, "flag verification failed");
-      const command = await call("run_local_command", { hypothesis_id: "hash", profile: "sha256", paths: ["source/app.js"], timeout_ms: 2000 });
+      const command = await call("run_local_command", { hypothesis_id: "H1", profile: "sha256", paths: ["source/app.js"], timeout_ms: 2000 });
       assert(command.outcome === "completed", "local command failed");
       const sourceEscape = join(challengeRoot, "source", "escape");
       rmSync(sourceEscape, { recursive: true, force: true });
       symlinkSync(outsideRoot, sourceEscape);
       await expectReject(
-        () => call("run_local_command", { hypothesis_id: "symlink-source", profile: "sha256", paths: ["source/escape/missing.js"], timeout_ms: 2000 }),
+        () => call("run_local_command", { hypothesis_id: "H1", profile: "sha256", paths: ["source/escape/missing.js"], timeout_ms: 2000 }),
         /Symlink path component rejected|Path escapes allowed root|Path escapes challenge directory/,
         "symlinked source parent was accepted",
       );
@@ -125,17 +126,17 @@ export default function (pi) {
       rmSync(exploitEscape, { recursive: true, force: true });
       symlinkSync(outsideRoot, exploitEscape);
       await expectReject(
-        () => call("write_exploit", { hypothesis_id: "symlink-exploit", relative_path: "escape/payload.py", language: "python", content: "print('no')\n" }),
+        () => call("write_exploit", { hypothesis_id: "H1", relative_path: "escape/payload.py", language: "python", content: "print('no')\n" }),
         /Symlink path component rejected|Path escapes allowed root|Path escapes challenge directory/,
         "symlinked exploit parent was accepted",
       );
       unlinkSync(exploitEscape);
-      const exploit = await call("write_exploit", { hypothesis_id: "exploit", relative_path: "fixture.py", language: "python", content: "print('picoCTF{stage2_exploit_fixture}')\n" });
-      const exploitRun = await call("run_local_command", { hypothesis_id: "exploit-run", profile: "run_exploit", paths: ["fixture.py"], timeout_ms: 2000 });
+      const exploit = await call("write_exploit", { hypothesis_id: "H1", relative_path: "fixture.py", language: "python", content: "print('picoCTF{stage2_exploit_fixture}')\n" });
+      const exploitRun = await call("run_local_command", { hypothesis_id: "H1", profile: "run_exploit", paths: ["fixture.py"], timeout_ms: 2000 });
       assert(exploit.evidence_id && exploitRun.outcome === "completed", "test exploit execution failed");
       const exploitEvidence = await call("verify_flag", { evidence_id: exploitRun.evidence_id });
       try {
-        await call("http_request", { hypothesis_id: "escape", method: "GET", path: "/../flag", action_kind: "recon", timeout_ms: 2000 });
+        await call("http_request", { hypothesis_id: "H1", method: "GET", path: "/../flag", action_kind: "recon", timeout_ms: 2000 });
         throw new Error("unsafe path accepted");
       } catch (error) {
         assert(error instanceof Error && /Unsafe request path|Path traversal/.test(error.message), "unsafe path rejection mismatch");
