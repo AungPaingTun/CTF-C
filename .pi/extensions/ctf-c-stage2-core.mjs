@@ -17,6 +17,7 @@ const MAX_SOURCE_ENTRIES = 128;
 const MAX_SOURCE_PATH = 512;
 const MAX_SOURCE_OFFSET = 8 * 1024 * 1024;
 const MAX_SOURCE_READ = 16 * 1024;
+const HYPOTHESIS_ID = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 let activeRun;
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -146,12 +147,15 @@ export function initializeCompetitionRun() {
 function persistState() {
   atomicWrite(activeRun.paths.state, `${JSON.stringify({ run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, started_at: activeRun.startedAt, deadline_at: activeRun.deadlineAt, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash }, null, 2)}\n`);
 }
-function ensureActive(count = true) {
+function ensureActive() {
   if (!activeRun) throw new Error("No active competition run");
   if (activeRun.status !== "active") throw new Error("Competition run is finalized");
   if (Date.now() >= activeRun.deadlineAt) throw new Error("Competition deadline exceeded");
+}
+function consumeAction() {
+  ensureActive();
   if (activeRun.actionCount >= activeRun.action_budget) throw new Error("Action budget exhausted");
-  if (count) activeRun.actionCount += 1;
+  activeRun.actionCount += 1;
   persistState();
 }
 function writeEvidence(entry, body) {
@@ -167,6 +171,9 @@ function storeCookies(response, url) {
   for (const value of response.headers.getSetCookie?.() ?? []) {
     const [name, ...parts] = value.split(";")[0].split("="); if (name && parts.length) activeRun.cookies.set(name, { name, value: parts.join("="), domain: url.hostname, path: "/", secure: /;\s*secure/i.test(value) });
   }
+  persistCookies();
+}
+function persistCookies() {
   atomicWrite(activeRun.paths.cookies, `${JSON.stringify({ schema_version: 1, run_id: activeRun.run_id, target_origin: activeRun.target_origin, cookies: [...activeRun.cookies.values()] }, null, 2)}\n`);
 }
 function contentType(headers) {
@@ -193,6 +200,9 @@ function requestParams(params) {
   if (suppliedContentType && !params.form && !params.json) throw new Error("Content-Type requires a form or JSON body");
   if (params.form && suppliedContentType && suppliedContentType !== "application/x-www-form-urlencoded") throw new Error("Conflicting Content-Type for form body");
   if (params.json && suppliedContentType && suppliedContentType !== "application/json") throw new Error("Conflicting Content-Type for JSON body");
+  let body = "";
+  try { body = params.form ? new URLSearchParams(params.form).toString() : params.json ? JSON.stringify(params.json) : ""; } catch { throw new Error("Invalid request body"); }
+  if (Buffer.byteLength(body) > MAX_BODY) throw new Error("Request body limit exceeded");
   const url = new URL(`${activeRun.target_origin}${params.path}`);
   for (const [key, value] of Object.entries(params.query ?? {})) { if (!/^[\w.-]{1,128}$/.test(key) || typeof value !== "string" || value.length > 1024) throw new Error("Invalid query parameter"); url.searchParams.set(key, value); }
   if (url.hostname !== activeRun.target.hostname || url.host !== activeRun.target.host) throw new Error("Target host is not allowed");
@@ -204,18 +214,40 @@ async function readBody(response, signal) {
   return Buffer.concat(chunks);
 }
 async function httpRequest(params) {
-  ensureActive(); const request = requestParams(params); const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), request.timeout); let body = Buffer.alloc(0); let response; let outcome = "completed"; let error = ""; const started = Date.now();
-  try { const headers = { ...(request.headers ?? {}) }; const cookies = cookieHeader(request.url); if (cookies) headers.Cookie = cookies; const init = { method: request.method, headers, redirect: "manual", signal: controller.signal }; if (request.form) { init.body = new URLSearchParams(request.form).toString(); if (!contentType(headers)) headers["content-type"] = "application/x-www-form-urlencoded"; } if (request.json) { init.body = JSON.stringify(request.json); if (!contentType(headers)) headers["content-type"] = "application/json"; } if (Buffer.byteLength(init.body ?? "") > MAX_BODY) throw new Error("Request body limit exceeded"); response = await fetch(request.url, init); storeCookies(response, request.url); body = await readBody(response, controller.signal); if (response.status >= 300 && response.status < 400) outcome = "redirect"; else if (response.status >= 400) outcome = "http_error"; } catch (caught) { outcome = controller.signal.aborted ? "timeout" : "error"; error = caught instanceof Error ? caught.message : "request failed"; } finally { clearTimeout(timer); }
+  ensureActive(); const request = requestParams(params); consumeAction(); const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), request.timeout); let body = Buffer.alloc(0); let response; let outcome = "completed"; let error = ""; const started = Date.now();
+  try { const headers = { ...(request.headers ?? {}) }; const cookies = cookieHeader(request.url); if (cookies) headers.Cookie = cookies; const init = { method: request.method, headers, redirect: "manual", signal: controller.signal }; if (request.form) { init.body = new URLSearchParams(request.form).toString(); if (!contentType(headers)) headers["content-type"] = "application/x-www-form-urlencoded"; } if (request.json) { init.body = JSON.stringify(request.json); if (!contentType(headers)) headers["content-type"] = "application/json"; } response = await fetch(request.url, init); storeCookies(response, request.url); body = await readBody(response, controller.signal); if (response.status >= 300 && response.status < 400) outcome = "redirect"; else if (response.status >= 400) outcome = "http_error"; } catch (caught) { outcome = controller.signal.aborted ? "timeout" : "error"; error = caught instanceof Error ? caught.message : "request failed"; } finally { clearTimeout(timer); }
   return writeEvidence({ tool: "http_request", action_kind: request.action_kind, duration_ms: Date.now() - started, outcome, status_code: response?.status ?? null, bytes: body.length, redirect_location_present: Boolean(response?.headers.has("location")), response_headers: headersForEvidence(response?.headers), content_type: response?.headers.get("content-type") ?? null, preview: sanitize(body.toString("utf8") || error, 1024), request: { method: request.method, path: request.path, query_hash: hash(JSON.stringify(request.query ?? {})), body_hash: hash(Buffer.from(request.form ? new URLSearchParams(request.form).toString() : request.json ? JSON.stringify(request.json) : "")) } }, body.length ? body : error);
 }
 function evidenceFor(id) {
   const item = activeRun.evidenceRecords.get(id); if (!item) throw new Error("Evidence does not belong to current run"); rejectSymlinks(activeRun.runRoot, item.privatePath); const publicRecord = JSON.parse(readFileSync(join(activeRun.paths.evidence, `${item.record.sequence}-${id}.json`), "utf8")); const body = readFileSync(item.privatePath); const { evidence_hash: evidenceHash, ...base } = publicRecord; if (hash(body) !== publicRecord.private_artifact_sha256 || hash(JSON.stringify(base)) !== evidenceHash) throw new Error("Evidence integrity check failed"); return { item, publicRecord, body };
 }
 function inspectEvidence(params) {
-  ensureActive(false); if (!/^e-\d{3,}$/.test(params.evidence_id)) throw new Error("Evidence ID is required"); const { publicRecord, body } = evidenceFor(params.evidence_id); const offset = params.offset ?? 0; const limit = params.limit ?? MAX_INSPECT; if (!Number.isInteger(offset) || offset < 0 || offset > MAX_BODY || !Number.isInteger(limit) || limit < 1 || limit > MAX_INSPECT) throw new Error("Invalid evidence inspection range"); const text = body.toString("utf8"); return { evidence_id: params.evidence_id, run_id: activeRun.run_id, status_code: publicRecord.status_code ?? null, outcome: publicRecord.outcome ?? null, content_type: publicRecord.content_type ?? null, response_headers: publicRecord.response_headers ?? {}, body: { offset, limit, total_bytes: body.length, text: sanitize(text.slice(offset, offset + limit), limit), truncated: offset + limit < text.length }, ...inspectHtml(text), json_summary: jsonSummary(text) };
+  ensureActive(); if (!/^e-\d{3,}$/.test(params.evidence_id)) throw new Error("Evidence ID is required"); const { publicRecord, body } = evidenceFor(params.evidence_id); const offset = params.offset ?? 0; const limit = params.limit ?? MAX_INSPECT; if (!Number.isInteger(offset) || offset < 0 || offset > MAX_BODY || !Number.isInteger(limit) || limit < 1 || limit > MAX_INSPECT) throw new Error("Invalid evidence inspection range"); const text = body.toString("utf8"); return { evidence_id: params.evidence_id, run_id: activeRun.run_id, status_code: publicRecord.status_code ?? null, outcome: publicRecord.outcome ?? null, content_type: publicRecord.content_type ?? null, response_headers: publicRecord.response_headers ?? {}, body: { offset, limit, total_bytes: body.length, text: sanitize(text.slice(offset, offset + limit), limit), truncated: offset + limit < text.length }, ...inspectHtml(text), json_summary: jsonSummary(text) };
 }
 function verifyFlag(params) {
-  ensureActive(false); const { body } = evidenceFor(params.evidence_id); const text = body.toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence"); activeRun.status = "solved"; activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; const result = { status: "solved", run_id: activeRun.run_id, target_origin: activeRun.target_origin, action_count: activeRun.actionCount, verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
+  ensureActive(); const { body } = evidenceFor(params.evidence_id); const text = body.toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence"); activeRun.status = "solved"; activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; const result = { status: "solved", run_id: activeRun.run_id, target_origin: activeRun.target_origin, action_count: activeRun.actionCount, verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
+}
+function cookieReplacementParams(params) {
+  const allowed = new Set(["hypothesis_id", "cookie_name", "cookie_value", "path"]);
+  if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("Cookie host and domain overrides are not allowed");
+  if (typeof params.hypothesis_id !== "string" || !HYPOTHESIS_ID.test(params.hypothesis_id)) throw new Error("Invalid hypothesis ID");
+  if (typeof params.cookie_name !== "string" || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(params.cookie_name)) throw new Error("Invalid cookie name");
+  if (typeof params.cookie_value !== "string" || !params.cookie_value || Buffer.byteLength(params.cookie_value) > 4096 || /[\x00-\x20\x7f;,]/.test(params.cookie_value)) throw new Error("Invalid cookie value");
+  const path = params.path ?? "/";
+  if (typeof path !== "string" || path.length > 512 || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x20\x7f;,?#\\\r\n]/.test(path)) throw new Error("Invalid cookie path");
+  let decoded;
+  try { decoded = decodeURIComponent(decodeURIComponent(path)); } catch { throw new Error("Invalid cookie path"); }
+  if (decoded.split("/").includes("..")) throw new Error("Invalid cookie path");
+  return { cookieName: params.cookie_name, cookieValue: params.cookie_value, path };
+}
+function replaceSessionCookie(params) {
+  ensureActive(); const cookie = cookieReplacementParams(params); consumeAction();
+  activeRun.cookies.set(cookie.cookieName, { name: cookie.cookieName, value: cookie.cookieValue, domain: activeRun.target.hostname, path: cookie.path, secure: activeRun.target.protocol === "https:" });
+  persistCookies();
+  const valueHash = hash(cookie.cookieValue);
+  const publicEvidence = { cookie_name: cookie.cookieName, target_host: activeRun.target.hostname, path: cookie.path, value_hash: valueHash, outcome: "cookie_replaced" };
+  const evidence = writeEvidence({ tool: "replace_session_cookie", ...publicEvidence }, JSON.stringify(publicEvidence));
+  return { evidence_id: evidence.evidence_id, outcome: "cookie_replaced", cookie_name: cookie.cookieName, path: cookie.path };
 }
 
 function sourceRoot() {
@@ -240,6 +272,7 @@ function listSource(params) {
   ensureActive(); const limit = params.limit ?? MAX_SOURCE_ENTRIES;
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SOURCE_ENTRIES) throw new Error("Invalid source list limit");
   const source = sourcePath(params.path, { directory: true });
+  consumeAction();
   const names = readdirSync(source.target).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
   const entries = names.slice(0, limit).map((name) => {
     const target = join(source.target, name);
@@ -253,6 +286,7 @@ function listSource(params) {
 function readSource(params) {
   ensureActive(); const source = sourcePath(params.path); const offset = params.offset ?? 0; const limit = params.limit ?? MAX_SOURCE_READ;
   if (!Number.isInteger(offset) || offset < 0 || offset > MAX_SOURCE_OFFSET || !Number.isInteger(limit) || limit < 1 || limit > MAX_SOURCE_READ || offset > source.stat.size) throw new Error("Invalid source read range");
+  consumeAction();
   const bytesToRead = Math.min(limit, source.stat.size - offset); const buffer = Buffer.alloc(bytesToRead); const descriptor = openSync(source.target, "r");
   try { readSync(descriptor, buffer, 0, bytesToRead, offset); } finally { closeSync(descriptor); }
   const text = buffer.toString("utf8"); const evidence = writeEvidence({ tool: "read_source", outcome: "completed", preview: sanitize(text, 1024), source_path: source.path, offset, total_bytes: source.stat.size }, buffer);
@@ -261,14 +295,15 @@ function readSource(params) {
 
 const executables = { file: ["/usr/bin/file", "/bin/file"], strings: ["/usr/bin/strings", "/bin/strings"], readelf: ["/usr/bin/readelf", "/opt/homebrew/bin/readelf"], objdump: ["/usr/bin/objdump", "/opt/homebrew/bin/objdump"], nm: ["/usr/bin/nm", "/usr/bin/nm-classic", "/opt/homebrew/bin/nm"], sha256: ["/usr/bin/shasum", "/bin/shasum"] };
 function localCommand(params) {
-  ensureActive(); if (!activeRun.source_root) throw new Error("Source analysis requires an optional source directory"); if (!Object.hasOwn(executables, params.profile)) throw new Error("Invalid source analysis profile"); const timeout = Number(params.timeout_ms); if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid timeout"); if (!Array.isArray(params.paths) || params.paths.length < 1 || params.paths.length > 8) throw new Error("Invalid source analysis paths"); const sourceRoot = realpathSync(activeRun.source_root); const paths = params.paths.map((path) => { if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) throw new Error("Unsafe source path"); const target = resolve(sourceRoot, path); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("Source path escapes supplied directory"); rejectSymlinks(sourceRoot, target); return target; }); const executable = executables[params.profile].find((path) => existsSync(path)); if (!executable) throw new Error("Source analysis executable unavailable"); const args = Array.isArray(params.args) ? params.args : []; if (args.length > 16 || args.some((arg) => typeof arg !== "string" || arg.length > 256)) throw new Error("Invalid source analysis arguments"); const commandArgs = params.profile === "sha256" ? ["-a", "256", ...paths] : [...args, ...paths]; return new Promise((resolveResult) => { const child = spawn(executable, commandArgs, { cwd: sourceRoot, shell: false, env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" } }); const out = []; let size = 0; const collect = (chunk) => { size += chunk.length; if (size <= MAX_BODY) out.push(chunk); else child.kill("SIGTERM"); }; child.stdout.on("data", collect); child.stderr.on("data", collect); const timer = setTimeout(() => child.kill("SIGTERM"), timeout); child.on("close", (code, signal) => { clearTimeout(timer); const body = Buffer.concat(out); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: size > MAX_BODY ? "output_limit" : signal ? "timeout" : code === 0 ? "completed" : "error", exit_code: code, preview: sanitize(body.toString("utf8")) }, body)); }); child.on("error", (error) => { clearTimeout(timer); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: "error", preview: sanitize(error.message) }, error.message)); }); }); }
+  ensureActive(); if (!activeRun.source_root) throw new Error("Source analysis requires an optional source directory"); if (!Object.hasOwn(executables, params.profile)) throw new Error("Invalid source analysis profile"); const timeout = Number(params.timeout_ms); if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid timeout"); if (!Array.isArray(params.paths) || params.paths.length < 1 || params.paths.length > 8) throw new Error("Invalid source analysis paths"); const sourceRoot = realpathSync(activeRun.source_root); const paths = params.paths.map((path) => { if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) throw new Error("Unsafe source path"); const target = resolve(sourceRoot, path); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("Source path escapes supplied directory"); rejectSymlinks(sourceRoot, target); return target; }); const executable = executables[params.profile].find((path) => existsSync(path)); if (!executable) throw new Error("Source analysis executable unavailable"); const args = Array.isArray(params.args) ? params.args : []; if (args.length > 16 || args.some((arg) => typeof arg !== "string" || arg.length > 256)) throw new Error("Invalid source analysis arguments"); const commandArgs = params.profile === "sha256" ? ["-a", "256", ...paths] : [...args, ...paths]; consumeAction(); return new Promise((resolveResult) => { const child = spawn(executable, commandArgs, { cwd: sourceRoot, shell: false, env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" } }); const out = []; let size = 0; const collect = (chunk) => { size += chunk.length; if (size <= MAX_BODY) out.push(chunk); else child.kill("SIGTERM"); }; child.stdout.on("data", collect); child.stderr.on("data", collect); const timer = setTimeout(() => child.kill("SIGTERM"), timeout); child.on("close", (code, signal) => { clearTimeout(timer); const body = Buffer.concat(out); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: size > MAX_BODY ? "output_limit" : signal ? "timeout" : code === 0 ? "completed" : "error", exit_code: code, preview: sanitize(body.toString("utf8")) }, body)); }); child.on("error", (error) => { clearTimeout(timer); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: "error", preview: sanitize(error.message) }, error.message)); }); }); }
 
 function textResult(value) { return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }; }
 const httpRequestTool = defineTool({ name: "http_request", label: "HTTP Request", description: "Perform one bounded same-origin Web request and retain its evidence.", parameters: Type.Object({ method: Type.Union([Type.Literal("GET"), Type.Literal("POST")]), path: Type.String(), query: Type.Optional(Type.Record(Type.String(), Type.String())), form: Type.Optional(Type.Record(Type.String(), Type.String())), json: Type.Optional(Type.Record(Type.String(), Type.Unknown())), headers: Type.Optional(Type.Record(Type.String(), Type.String())), action_kind: Type.String(), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await httpRequest(params)); } });
 const inspectEvidenceTool = defineTool({ name: "inspect_evidence", label: "Inspect Evidence", description: "Inspect bounded structured details from retained evidence in this run.", parameters: Type.Object({ evidence_id: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(inspectEvidence(params)); } });
 const listSourceTool = defineTool({ name: "list_source", label: "List Source", description: "List one bounded supplied-source directory.", parameters: Type.Object({ path: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(listSource(params)); } });
 const readSourceTool = defineTool({ name: "read_source", label: "Read Source", description: "Read one bounded range from a supplied source file.", parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(readSource(params)); } });
+const replaceSessionCookieTool = defineTool({ name: "replace_session_cookie", label: "Replace Session Cookie", description: "Replace one named cookie for the exact active target origin and retain redacted evidence.", parameters: Type.Object({ hypothesis_id: Type.String(), cookie_name: Type.String(), cookie_value: Type.String(), path: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(replaceSessionCookie(params)); } });
 const verifyFlagTool = defineTool({ name: "verify_flag", label: "Verify Flag", description: "Verify a candidate only against retained evidence and persist the solved result.", parameters: Type.Object({ evidence_id: Type.String(), candidate: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(verifyFlag(params)); } });
 const localCommandTool = defineTool({ name: "run_local_command", label: "Analyze Source", description: "Run one bounded read-only analysis profile against supplied source.", parameters: Type.Object({ profile: Type.String(), paths: Type.Array(Type.String()), args: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await localCommand(params)); } });
-export const competitionTools = [httpRequestTool, inspectEvidenceTool, listSourceTool, readSourceTool, localCommandTool, verifyFlagTool];
+export const competitionTools = [httpRequestTool, inspectEvidenceTool, listSourceTool, readSourceTool, localCommandTool, replaceSessionCookieTool, verifyFlagTool];
 export default function (pi) { if (process.env.CTFC_COMPETITION_RUN_RECORD) initializeCompetitionRun(); for (const tool of competitionTools) pi.registerTool(tool); }

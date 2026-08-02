@@ -71,7 +71,7 @@ export default function (pi) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   process.env.CTFC_STAGE2_TEST_MODE = "local-fixture";
-  assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "verify_flag"]);
+   assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "replace_session_cookie", "verify_flag"]);
   const httpTool = competitionTools.find((tool) => tool.name === "http_request");
   const verifyTool = competitionTools.find((tool) => tool.name === "verify_flag");
   for (const [name, configured] of Object.entries(flags)) {
