@@ -38,3 +38,6 @@ node_modules/
 
 # Validation run output
 results/validation/
+
+# Private competition runtime records
+.ctf-c/competition-runs/
