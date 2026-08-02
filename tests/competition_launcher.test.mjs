@@ -4,18 +4,16 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { initializeCompetitionRun, stage2Tools } from "../.pi/extensions/ctf-c-stage2-core.mjs";
+import { competitionTools, initializeCompetitionRun } from "../.pi/extensions/ctf-c-stage2-core.mjs";
 
 const root = process.cwd();
 const helper = join(root, "scripts", "create_competition_run.mjs");
 const launcher = join(root, "scripts", "run_competition.sh");
 const temp = mkdtempSync(join(tmpdir(), "ctf-c-competition-test-"));
-const description = join(temp, "challenge.txt");
 const runtimeRoot = join(root, ".ctf-c", "competition-runs", "test");
-writeFileSync(description, "Find the flag in the session behavior.\n");
 
 function runHelper(args) {
-  return spawnSync(process.execPath, [helper, ...args], { cwd: root, encoding: "utf8" });
+  return spawnSync(process.execPath, [helper, ...args], { cwd: root, encoding: "utf8", env: { ...process.env, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot } });
 }
 
 function assertRejected(args, text) {
@@ -24,20 +22,26 @@ function assertRejected(args, text) {
   assert.match(`${result.stderr}${result.stdout}`, new RegExp(text, "i"));
 }
 
-const base = ["--target", "http://example.test:8080", "--approve", "--description-file", description];
 export default function (pi) {
   pi.on("session_start", async () => {
     try {
-  assertRejected(["--target", "http://example.test:8080", "--description-file", description], "approve");
-  assertRejected(["--target", "not-a-url", "--approve", "--description-file", description], "valid URL");
-  assertRejected(["--target", "http://user:pass@example.test:8080", "--approve", "--description-file", description], "credentials");
-  assertRejected(["--target", "http://example.test:8080/#fragment", "--approve", "--description-file", description], "fragment");
+   assertRejected(["--target", "http://example.test:8080", "--description", "x"], "approve");
+   assertRejected(["--target", "not-a-url", "--approve"], "valid URL");
+   assertRejected(["--target", "http://user:pass@example.test:8080", "--approve"], "credentials");
+   assertRejected(["--target", "http://example.test:8080/#fragment", "--approve"], "fragment");
+   assertRejected(["--target", "http://example.test:8080", "--approve", "--flag-regex", "["], "Flag regex");
 
   const fakePi = join(temp, "pi");
   const fakeOutput = join(temp, "pi-args.txt");
   writeFileSync(fakePi, `#!/bin/sh\nprintf '%s\\n' "$@" > "${fakeOutput}"\nprintf 'record=%s\\n' "$CTFC_COMPETITION_RUN_RECORD" >> "${fakeOutput}"\n`);
   chmodSync(fakePi, 0o755);
-  const launch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve", "--description-file", description], {
+   const defaultLaunch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve"], {
+     cwd: root,
+     env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot },
+     encoding: "utf8",
+   });
+   assert.equal(defaultLaunch.status, 0, defaultLaunch.stderr);
+   const launch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve", "--description", "Find the flag."], {
     cwd: root,
     env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot },
     encoding: "utf8",
@@ -45,31 +49,44 @@ export default function (pi) {
   assert.equal(launch.status, 0, launch.stderr);
   const output = readFileSync(fakeOutput, "utf8");
   assert.match(output, /--no-builtin-tools/);
-  assert.doesNotMatch(output, /auditor|begin_investigation|record_hypotheses/);
   const recordPath = output.match(/^record=(.+)$/m)?.[1];
   assert.ok(recordPath && existsSync(recordPath), "private run record was not created");
   const record = JSON.parse(readFileSync(recordPath, "utf8"));
   assert.equal(record.target_origin, "http://example.test:8080");
   assert.equal(record.approved, true);
+  assert.equal(record.flag_regex, "picoCTF\\{[^}\\r\\n]{1,256}\\}");
   assert.equal(statSync(recordPath).mode & 0o777, 0o600, "run record is not private");
   assert.equal(statSync(record.paths.run_root).mode & 0o777, 0o700, "runtime directory is not private");
   execFileSync("git", ["check-ignore", "-q", record.paths.run_root], { cwd: root, stdio: "ignore" });
 
-  const server = createServer((_request, response) => {
+  const flags = {
+    pico: { regex: "picoCTF\\{[^}\\r\\n]{1,256}\\}", value: "picoCTF{configured_pattern}" },
+    flag: { regex: "flag\\{[^}\\r\\n]{1,256}\\}", value: "flag{configured_pattern}" },
+    cylab: { regex: "CYLAB\\{[^}\\r\\n]{1,256}\\}", value: "CYLAB{configured_pattern}" },
+  };
+  const server = createServer((request, response) => {
     response.writeHead(200, { "content-type": "text/plain" });
-    response.end("typed action response");
+    response.end(flags[request.url.slice(1)]?.value ?? "typed action response");
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
-  const local = runHelper(["--target", `http://127.0.0.1:${address.port}`, ...base.slice(2)]);
-  assert.equal(local.status, 0, local.stderr);
-  const localRecordPath = local.stdout.trim();
-  process.env.CTFC_COMPETITION_RUN_RECORD = localRecordPath;
   process.env.CTFC_STAGE2_TEST_MODE = "local-fixture";
-  initializeCompetitionRun();
-  const httpTool = stage2Tools.find((tool) => tool.name === "http_request");
-  const result = await httpTool.execute("direct-action", { hypothesis_id: "H1", method: "GET", path: "/", action_kind: "recon", timeout_ms: 2000 });
-  assert.ok(result.details?.evidence_id, "first typed action did not produce evidence");
+  assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "verify_flag"]);
+  const httpTool = competitionTools.find((tool) => tool.name === "http_request");
+  const verifyTool = competitionTools.find((tool) => tool.name === "verify_flag");
+  for (const [name, configured] of Object.entries(flags)) {
+    const local = runHelper(["--target", `http://127.0.0.1:${address.port}`, "--approve", "--description", `Verify ${name}.`, "--flag-regex", configured.regex]);
+    assert.equal(local.status, 0, local.stderr);
+    const localRecordPath = local.stdout.trim();
+    const localRecord = JSON.parse(readFileSync(localRecordPath, "utf8"));
+    assert.equal(localRecord.flag_regex, configured.regex);
+    process.env.CTFC_COMPETITION_RUN_RECORD = localRecordPath;
+    initializeCompetitionRun();
+    const result = await httpTool.execute(`direct-action-${name}`, { method: "GET", path: `/${name}`, action_kind: "recon", timeout_ms: 2000 });
+    assert.ok(result.details?.evidence_id, "first typed action did not produce evidence");
+    const verified = await verifyTool.execute(`verify-${name}`, { evidence_id: result.details.evidence_id });
+    assert.equal(verified.details?.flag, configured.value, `configured ${name} flag was not verified`);
+  }
   server.close();
   delete process.env.CTFC_COMPETITION_RUN_RECORD;
   delete process.env.CTFC_STAGE2_TEST_MODE;

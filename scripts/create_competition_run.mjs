@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const FLAG_REGEX = "picoCTF\\{[^}\\r\\n]{1,256}\\}";
+const DEFAULT_FLAG_REGEX = "picoCTF\\{[^}\\r\\n]{1,256}\\}";
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -64,6 +64,22 @@ function regularFile(raw) {
   return path;
 }
 
+function descriptionValue(args) {
+  const inline = value(args, "--description", false);
+  const file = value(args, "--description-file", false);
+  if (inline && file) fail("Use either --description or --description-file");
+  if (inline) return inline;
+  if (file) return readFileSync(regularFile(file), "utf8");
+  return "Direct Web competition run";
+}
+
+function flagRegexValue(args) {
+  const pattern = value(args, "--flag-regex", false) || DEFAULT_FLAG_REGEX;
+  if (pattern.length > 512 || /[\x00-\x1f\x7f]/.test(pattern)) fail("Flag regex is invalid");
+  try { new RegExp(pattern); } catch { fail("Flag regex is invalid"); }
+  return pattern;
+}
+
 function positiveInteger(raw, name, fallback, maximum) {
   const valueToCheck = raw || String(fallback);
   if (!/^[1-9][0-9]*$/.test(valueToCheck)) fail(`${name} must be a positive integer`);
@@ -75,11 +91,11 @@ function positiveInteger(raw, name, fallback, maximum) {
 const args = process.argv.slice(2);
 if (!args.includes("--approve")) fail("Explicit --approve is required");
 const targetOrigin = validateTarget(value(args, "--target"));
-const descriptionPath = regularFile(value(args, "--description-file"));
 const sourceRoot = existingDirectory(value(args, "--source", false), "Source");
 const timeBudget = positiveInteger(value(args, "--time-budget", false), "Time budget", 15, 30);
 const actionBudget = positiveInteger(value(args, "--action-budget", false), "Action budget", 20, 40);
-const description = readFileSync(descriptionPath, "utf8");
+const description = descriptionValue(args);
+const flagRegex = flagRegexValue(args);
 const projectRoot = process.env.CTFC_PROJECT_ROOT ? resolve(process.env.CTFC_PROJECT_ROOT) : process.cwd();
 const runtimeBase = resolve(process.env.CTFC_COMPETITION_RUNTIME_ROOT || join(projectRoot, ".ctf-c", "competition-runs"));
 mkdirSync(runtimeBase, { recursive: true, mode: 0o700 });
@@ -106,7 +122,7 @@ const record = {
   source_root: sourceRoot,
   time_budget: timeBudget,
   action_budget: actionBudget,
-  flag_regex: FLAG_REGEX,
+  flag_regex: flagRegex,
   paths,
 };
 const recordPath = join(runRoot, "run-record.json");
