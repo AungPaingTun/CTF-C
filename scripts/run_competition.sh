@@ -16,6 +16,7 @@ flag_regex=''
 approved=false
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 project_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+caller_root=$(pwd -P)
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -31,6 +32,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$source" in
+  ''|/*) ;;
+  *) source="$caller_root/$source" ;;
+esac
+case "$description_file" in
+  ''|/*) ;;
+  *) description_file="$caller_root/$description_file" ;;
+esac
+
 [ -n "$target" ] || { printf 'Target is required\n' >&2; exit 2; }
 [ "$approved" = true ] || { printf 'Explicit --approve is required\n' >&2; exit 1; }
 [ -n "$description" ] && [ -n "$description_file" ] && { printf 'Use either --description or --description-file\n' >&2; exit 2; }
@@ -44,7 +54,14 @@ done
 [ -n "$flag_regex" ] && set -- "$@" --flag-regex "$flag_regex"
 record_path=$(CTFC_PROJECT_ROOT="$project_root" node "$script_dir/create_competition_run.mjs" "$@")
 
+cd "$project_root"
 description=$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).description)' "$record_path")
 source_hint=$(node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(r.source_root || "none")' "$record_path")
-prompt="Solve this Web CTF challenge directly: $description. Optional source directory: $source_hint. Use typed tools only, inspect evidence after requests, reason and revise after each result, verify the flag from retained evidence, and stop."
-exec env CTFC_COMPETITION_RUN_RECORD="$record_path" pi --no-builtin-tools --offline --no-session --approve "$prompt"
+prompt="Direct 15-minute Web solve, not a source-audit workflow. Make the first same-origin HTTP request immediately; do not inspect an empty optional source directory. Use response previews first, and inspect retained evidence only when a response is truncated or form/link/body detail is needed. Preserve and use cookie state. After discovering a concrete exploit primitive, perform its corresponding state transition before guessing unrelated paths. For a leaked admin session, adopt it from the retained evidence, request the authenticated page, then verify the flag. Treat failed endpoint guesses as evidence to pivot, not a reason to repeat broad reconnaissance. Verify a flag only from retained evidence. If unable to progress, call finalize_result with not_solved and a concise safe reason. Challenge: $description. Optional source directory: $source_hint."
+if env CTFC_COMPETITION_RUN_RECORD="$record_path" pi --no-builtin-tools --offline --no-session --approve "$prompt"; then
+  pi_status=0
+else
+  pi_status=$?
+fi
+node "$script_dir/finalize_competition_run.mjs" "$record_path" "$pi_status"
+exit "$pi_status"

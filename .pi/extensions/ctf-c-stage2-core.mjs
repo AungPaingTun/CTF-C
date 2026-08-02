@@ -18,6 +18,8 @@ const MAX_SOURCE_PATH = 512;
 const MAX_SOURCE_OFFSET = 8 * 1024 * 1024;
 const MAX_SOURCE_READ = 16 * 1024;
 const HYPOTHESIS_ID = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+const ACCOUNT_KEY = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const TERMINAL_STATUSES = new Set(["not_solved", "timeout", "action_budget_exhausted", "infrastructure_failure"]);
 let activeRun;
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -225,7 +227,7 @@ function inspectEvidence(params) {
   ensureActive(); if (!/^e-\d{3,}$/.test(params.evidence_id)) throw new Error("Evidence ID is required"); const { publicRecord, body } = evidenceFor(params.evidence_id); const offset = params.offset ?? 0; const limit = params.limit ?? MAX_INSPECT; if (!Number.isInteger(offset) || offset < 0 || offset > MAX_BODY || !Number.isInteger(limit) || limit < 1 || limit > MAX_INSPECT) throw new Error("Invalid evidence inspection range"); const text = body.toString("utf8"); return { evidence_id: params.evidence_id, run_id: activeRun.run_id, status_code: publicRecord.status_code ?? null, outcome: publicRecord.outcome ?? null, content_type: publicRecord.content_type ?? null, response_headers: publicRecord.response_headers ?? {}, body: { offset, limit, total_bytes: body.length, text: sanitize(text.slice(offset, offset + limit), limit), truncated: offset + limit < text.length }, ...inspectHtml(text), json_summary: jsonSummary(text) };
 }
 function verifyFlag(params) {
-  ensureActive(); const { body } = evidenceFor(params.evidence_id); const text = body.toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence"); activeRun.status = "solved"; activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; const result = { status: "solved", run_id: activeRun.run_id, target_origin: activeRun.target_origin, action_count: activeRun.actionCount, verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
+  ensureActive(); const { body } = evidenceFor(params.evidence_id); const text = body.toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence"); activeRun.status = "solved"; activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; const result = { status: "solved", run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
 }
 function cookieReplacementParams(params) {
   const allowed = new Set(["hypothesis_id", "cookie_name", "cookie_value", "path"]);
@@ -248,6 +250,39 @@ function replaceSessionCookie(params) {
   const publicEvidence = { cookie_name: cookie.cookieName, target_host: activeRun.target.hostname, path: cookie.path, value_hash: valueHash, outcome: "cookie_replaced" };
   const evidence = writeEvidence({ tool: "replace_session_cookie", ...publicEvidence }, JSON.stringify(publicEvidence));
   return { evidence_id: evidence.evidence_id, outcome: "cookie_replaced", cookie_name: cookie.cookieName, path: cookie.path };
+}
+function adoptSessionCookieParams(params) {
+  const allowed = new Set(["evidence_id", "cookie_name", "account_key"]);
+  if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("Unsupported session adoption parameter");
+  if (typeof params.evidence_id !== "string" || !/^e-\d{3,}$/.test(params.evidence_id)) throw new Error("Invalid evidence ID");
+  if (typeof params.account_key !== "string" || !ACCOUNT_KEY.test(params.account_key)) throw new Error("Invalid account key");
+  const { publicRecord, body } = evidenceFor(params.evidence_id);
+  if (publicRecord.tool !== "http_request" || publicRecord.request?.method !== "GET" || publicRecord.request?.path !== "/sessions") throw new Error("Evidence is not a /sessions response");
+  const escapedKey = params.account_key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = body.toString("utf8").match(new RegExp(`session:([^,\\s<]{1,4096}),\\s*\\{[^{}]{0,512}['"]key['"]\\s*:\\s*['"]${escapedKey}['"]`));
+  if (!match) throw new Error("Named session was not found in retained evidence");
+  return { cookie: cookieReplacementParams({ hypothesis_id: "EvidenceAdoption", cookie_name: params.cookie_name, cookie_value: match[1] }), accountKey: params.account_key };
+}
+function adoptSessionCookie(params) {
+  ensureActive(); const { cookie, accountKey } = adoptSessionCookieParams(params); consumeAction();
+  activeRun.cookies.set(cookie.cookieName, { name: cookie.cookieName, value: cookie.cookieValue, domain: activeRun.target.hostname, path: "/", secure: activeRun.target.protocol === "https:" });
+  persistCookies();
+  const publicEvidence = { source_evidence_id: params.evidence_id, cookie_name: cookie.cookieName, target_host: activeRun.target.hostname, account_key: accountKey, path: "/", value_hash: hash(cookie.cookieValue), outcome: "cookie_adopted" };
+  const evidence = writeEvidence({ tool: "adopt_session_cookie", ...publicEvidence }, JSON.stringify(publicEvidence));
+  return { evidence_id: evidence.evidence_id, outcome: "cookie_adopted", source_evidence_id: params.evidence_id, cookie_name: cookie.cookieName, account_key: accountKey, path: "/" };
+}
+function finalizeResult(params) {
+  if (!activeRun) throw new Error("No active competition run");
+  if (activeRun.status === "solved") return { status: "solved", already_finalized: true };
+  if (activeRun.status !== "active") return { status: activeRun.status, already_finalized: true };
+  if (!TERMINAL_STATUSES.has(params.status)) throw new Error("Invalid terminal result status");
+  const reasonCodes = new Set(["no_progress", "deadline_reached", "action_budget_reached", "runner_failure"]);
+  if (params.reason_code !== undefined && !reasonCodes.has(params.reason_code)) throw new Error("Invalid terminal reason code");
+  activeRun.status = params.status;
+  const result = { status: params.status, run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, finalized_at: new Date().toISOString() };
+  if (params.reason_code) result.reason_code = params.reason_code;
+  atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState();
+  return { status: params.status, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash };
 }
 
 function sourceRoot() {
@@ -303,7 +338,9 @@ const inspectEvidenceTool = defineTool({ name: "inspect_evidence", label: "Inspe
 const listSourceTool = defineTool({ name: "list_source", label: "List Source", description: "List one bounded supplied-source directory.", parameters: Type.Object({ path: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(listSource(params)); } });
 const readSourceTool = defineTool({ name: "read_source", label: "Read Source", description: "Read one bounded range from a supplied source file.", parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(readSource(params)); } });
 const replaceSessionCookieTool = defineTool({ name: "replace_session_cookie", label: "Replace Session Cookie", description: "Replace one named cookie for the exact active target origin and retain redacted evidence.", parameters: Type.Object({ hypothesis_id: Type.String(), cookie_name: Type.String(), cookie_value: Type.String(), path: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(replaceSessionCookie(params)); } });
+const adoptSessionCookieTool = defineTool({ name: "adopt_session_cookie", label: "Adopt Session Cookie", description: "Adopt a named account session from current-run GET /sessions evidence without returning its value.", parameters: Type.Object({ evidence_id: Type.String(), cookie_name: Type.String(), account_key: Type.String() }), async execute(_id, params) { return textResult(adoptSessionCookie(params)); } });
 const verifyFlagTool = defineTool({ name: "verify_flag", label: "Verify Flag", description: "Verify a candidate only against retained evidence and persist the solved result.", parameters: Type.Object({ evidence_id: Type.String(), candidate: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(verifyFlag(params)); } });
+const finalizeResultTool = defineTool({ name: "finalize_result", label: "Finalize Result", description: "Persist a safe terminal non-solved result when the direct Web solve cannot continue.", parameters: Type.Object({ status: Type.Union([Type.Literal("not_solved"), Type.Literal("timeout"), Type.Literal("action_budget_exhausted"), Type.Literal("infrastructure_failure")]), reason_code: Type.Optional(Type.Union([Type.Literal("no_progress"), Type.Literal("deadline_reached"), Type.Literal("action_budget_reached"), Type.Literal("runner_failure")])) }), async execute(_id, params) { return textResult(finalizeResult(params)); } });
 const localCommandTool = defineTool({ name: "run_local_command", label: "Analyze Source", description: "Run one bounded read-only analysis profile against supplied source.", parameters: Type.Object({ profile: Type.String(), paths: Type.Array(Type.String()), args: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await localCommand(params)); } });
-export const competitionTools = [httpRequestTool, inspectEvidenceTool, listSourceTool, readSourceTool, localCommandTool, replaceSessionCookieTool, verifyFlagTool];
+export const competitionTools = [httpRequestTool, inspectEvidenceTool, listSourceTool, readSourceTool, localCommandTool, replaceSessionCookieTool, adoptSessionCookieTool, verifyFlagTool, finalizeResultTool];
 export default function (pi) { if (process.env.CTFC_COMPETITION_RUN_RECORD) initializeCompetitionRun(); for (const tool of competitionTools) pi.registerTool(tool); }

@@ -18,7 +18,7 @@ export default function (pi) {
   pi.on("session_start", async () => {
     const recordPath = process.env.CTFC_COMPETITION_RUN_RECORD;
     if (!recordPath) throw new Error("competition flow requires a private run record");
-    assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "replace_session_cookie", "verify_flag"]);
+    assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"]);
     const record = JSON.parse(readFileSync(recordPath, "utf8"));
     const users = new Set();
     const server = createServer(async (request, response) => {
