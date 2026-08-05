@@ -41,23 +41,71 @@ export default function (pi) {
      cwd: temp,
      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot },
      encoding: "utf8",
-   });
-   assert.equal(defaultLaunch.status, 0, defaultLaunch.stderr);
-   const launch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve", "--description", "Find the flag."], {
+    });
+    assert.equal(defaultLaunch.status, 0, defaultLaunch.stderr);
+    const defaultOutput = readFileSync(fakeOutput, "utf8");
+    assert.doesNotMatch(defaultOutput, /--provider|--model|--thinking/);
+    const launch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve", "--description", "Find the flag.", "--pi-provider", "opencode-go", "--pi-model", "deepseek-v4-pro", "--pi-thinking", "off"], {
      cwd: temp,
     env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot },
     encoding: "utf8",
   });
-  assert.equal(launch.status, 0, launch.stderr);
+   assert.equal(launch.status, 0, launch.stderr);
   const output = readFileSync(fakeOutput, "utf8");
    assert.match(output, /--no-builtin-tools/);
+    assert.match(output, /--offline/);
+    assert.match(output, /--no-session/);
+    assert.match(output, /--approve/);
+     assert.match(output, /--tools\nhttp_request,websocket_exchange,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
+    assert.match(output, /--provider\nopencode-go/);
+    assert.match(output, /--model\ndeepseek-v4-pro/);
+    assert.match(output, /--thinking\noff/);
    assert.match(output, new RegExp(`cwd=${root.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")}`));
-   assert.match(output, /tools=http_request,inspect_evidence,list_source,read_source,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
+       assert.match(output, /tools=http_request,websocket_exchange,start_competition_run,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
+     assert.match(output, /Derive a specific hypothesis from retained evidence before each request/);
+     assert.match(output, /Mutate an observed route before unrelated endpoints/);
+     assert.match(output, /Authentication or session evidence means prioritize observed redirects, cookies, links, forms, comments, and authenticated routes/);
+      assert.match(output, /Before starting a fresh multi-step branch, check the remaining time and action budget/);
+      assert.match(output, /For a deterministic identifier transformation such as MD5, use compute_digest before hypothesis-route requests/);
+      assert.match(output, /DECISION LOOP: After root reconnaissance and every meaningful response/);
+      assert.match(output, /Maintain exactly one primary hypothesis and one backup hypothesis/);
+      assert.match(output, /Before starting a fresh multi-step branch, check the remaining time and action budget/);
+      assert.match(output, /observed multipart file form means submit one evidence-backed multipart request first/);
+       assert.match(output, /When a multipart form has no hidden inputs, omit multipart\.evidence_form_fields; source evidence plus the observed file field is sufficient/);
+       assert.match(output, /source_evidence_id is the page containing the observed form; submit multipart POST to the form observed action path/);
+       assert.match(output, /use method POST, and use action_kind exactly submit/);
+       assert.match(output, /Classify deterministic unavailable or unconfigured capabilities as Unavailable Capability/);
+      assert.match(output, /\[UNAVAILABLE_CAPABILITY\]/);
+      assert.match(output, /Distinguish DNS failure, connection refused, timeout, TLS failure, HTTP response, redirect, and application error/);
+       assert.match(output, /Expand route families only after new evidence, contradiction, or verified observation/);
+       assert.match(output, /If unable to progress, call finalize_result with not_solved/);
+       assert.match(output, /Rank evidence as authenticated response > server-generated metadata > redirect targets > HTML forms > comments > headers > error messages > timing > speculation/);
+       assert.match(output, /Derive a specific hypothesis from retained evidence before each request/);
+       assert.match(output, /do not spray guesses such as \/api, \/debug, \/users, \/admin/);
+       assert.match(output, /retire contradicted hypotheses, promote the strongest supported alternative/);
+        assert.match(output, /complete the smallest evidence-backed chain: discovery/);
+        assert.match(output, /choose one highest-information or verification action/);
+       assert.match(output, /EXPLOIT COMPLETION: When retained evidence strongly supports a concrete primitive, leave discovery mode/);
+      assert.match(output, /next action that obtains protected data, the missing parameter, or likely flag-bearing evidence/);
+       assert.match(output, /do not spend actions merely increasing confidence in an already-supported primitive/);
+       assert.match(output, /Continue until verification succeeds, evidence disproves the chain, the chain becomes impossible, or the deadline or action budget requires termination/);
+      assert.match(output, /Confirmed server-side template evaluation means perform only minimum confirmation, then prioritize extraction/);
+     assert.match(output, /observed dynamic object route or predictable identifier transformation means identify the invariant route family/);
+     assert.match(output, /derive candidates only from retained evidence or a confirmed deterministic transform using compute_digest/);
+      assert.match(output, /An error, status, or body differential suggesting injection or parser behavior means use the smallest differential confirmation, then prioritize extraction/);
+      assert.match(output, /An asynchronous workflow means reserve actions for polling, retrieval, and verify_flag/);
+      assert.match(output, /When retained evidence is binary or WASM, inspect that exact evidence with inspect_evidence using wasm_summary, strings, or hex before any additional HTTP request/);
+      assert.match(output, /derive private evidence and use normal verify_flag; do not brute-force keys or execute the artifact/);
+       assert.match(output, /this is mandatory/);
+     assert.match(output, /FIRST-ACTION CONTRACT: The first successful tool call must be http_request/);
+     assert.match(output, /method GET, path \/, action_kind recon, timeout_ms 5000/);
+     assert.match(output, /Valid action_kind values are exactly recon, login, authenticated_request, submit, and trigger/);
   const recordPath = output.match(/^record=(.+)$/m)?.[1];
   assert.ok(recordPath && existsSync(recordPath), "private run record was not created");
   const record = JSON.parse(readFileSync(recordPath, "utf8"));
-  assert.equal(record.target_origin, "http://example.test:8080");
-  assert.equal(record.approved, true);
+   assert.equal(record.target_origin, "http://example.test:8080");
+   assert.equal(record.approved, true);
+   assert.equal(record.action_budget, 20);
   assert.equal(record.flag_regex, "picoCTF\\{[^}\\r\\n]{1,256}\\}");
   assert.equal(statSync(recordPath).mode & 0o777, 0o600, "run record is not private");
    assert.equal(statSync(record.paths.run_root).mode & 0o777, 0o700, "runtime directory is not private");
@@ -76,18 +124,23 @@ export default function (pi) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   process.env.CTFC_STAGE2_TEST_MODE = "local-fixture";
-   assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "inspect_evidence", "list_source", "read_source", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"]);
-  const httpTool = competitionTools.find((tool) => tool.name === "http_request");
-  const verifyTool = competitionTools.find((tool) => tool.name === "verify_flag");
+    assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "websocket_exchange", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"]);
+   const httpTool = competitionTools.find((tool) => tool.name === "http_request");
+   const digestTool = competitionTools.find((tool) => tool.name === "compute_digest");
+   const verifyTool = competitionTools.find((tool) => tool.name === "verify_flag");
   for (const [name, configured] of Object.entries(flags)) {
     const local = runHelper(["--target", `http://127.0.0.1:${address.port}`, "--approve", "--description", `Verify ${name}.`, "--flag-regex", configured.regex]);
     assert.equal(local.status, 0, local.stderr);
     const localRecordPath = local.stdout.trim();
     const localRecord = JSON.parse(readFileSync(localRecordPath, "utf8"));
     assert.equal(localRecord.flag_regex, configured.regex);
-    process.env.CTFC_COMPETITION_RUN_RECORD = localRecordPath;
-    initializeCompetitionRun();
-    const result = await httpTool.execute(`direct-action-${name}`, { method: "GET", path: `/${name}`, action_kind: "recon", timeout_ms: 2000 });
+     process.env.CTFC_COMPETITION_RUN_RECORD = localRecordPath;
+     initializeCompetitionRun();
+     const digest = await digestTool.execute(`digest-${name}`, { algorithm: "md5", text: "launcher-safe-input", purpose: "local deterministic test" });
+     assert.equal(digest.details.digest, "a3e323ed331169673938b48c8b2967f9");
+     assert.doesNotMatch(JSON.stringify(digest.details), /launcher-safe-input/);
+     assert.equal(localRecord.source_root, null, "digest test unexpectedly requires a source root");
+     const result = await httpTool.execute(`direct-action-${name}`, { method: "GET", path: `/${name}`, action_kind: "recon", timeout_ms: 2000, reasoning: { evidence_summary: ["The local launcher fixture exposes the requested flag route."], leading_hypothesis: `The route /${name} contains the configured flag.`, supporting_evidence: ["The route is provided by the local fixture."], experiment: `GET /${name} configured-flag request`, expected_observation: "The response contains the configured flag.", confidence: 0.8, untested_experiments: [] } });
     assert.ok(result.details?.evidence_id, "first typed action did not produce evidence");
     const verified = await verifyTool.execute(`verify-${name}`, { evidence_id: result.details.evidence_id });
     assert.equal(verified.details?.flag, configured.value, `configured ${name} flag was not verified`);

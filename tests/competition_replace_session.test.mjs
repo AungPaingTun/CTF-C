@@ -10,6 +10,7 @@ function tool(name) {
 }
 
 async function call(name, params) {
+  if (name === "http_request") params = { ...params, reasoning: { evidence_summary: ["The session fixture exposes the requested route."], leading_hypothesis: `The route ${params.path} tests the current session hypothesis.`, supporting_evidence: ["The local session fixture is the active evidence source."], experiment: `${params.method} ${params.path} session request`, expected_observation: "The fixture returns a bounded session response.", confidence: 0.5, untested_experiments: [] } };
   const result = await tool(name).execute(`competition-replace-session-${name}`, params);
   return result.details ?? JSON.parse(result.content[0].text);
 }
@@ -29,10 +30,10 @@ export default function (pi) {
     const server = createServer((request, response) => {
       seenCookies.push(request.headers.cookie ?? "");
        if (request.method === "POST" && request.url === "/register") {
-         response.end("registered");
+         response.end("registered <a href=\"/login\">login</a>");
        } else if (request.method === "POST" && request.url === "/login") {
          response.setHeader("Set-Cookie", `session=${guestCookie}; Path=/`);
-         response.end("logged in");
+         response.end("logged in <a href=\"/sessions\">sessions</a>");
       } else if (request.method === "GET" && request.url === "/sessions") {
          response.end(`session:${adminCookie}, {'_permanent': True, 'key': 'admin'}<p>session:${guestCookie}, {'_permanent': True, 'key': 'guest'}</p>`);
       } else if (request.method === "GET" && request.url === "/" && request.headers.cookie === `session=${adminCookie}`) {

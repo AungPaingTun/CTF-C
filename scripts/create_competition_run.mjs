@@ -90,10 +90,11 @@ function positiveInteger(raw, name, fallback, maximum) {
 
 const args = process.argv.slice(2);
 if (!args.includes("--approve")) fail("Explicit --approve is required");
+const insecureTls = args.includes("--allow-insecure-tls");
 const targetOrigin = validateTarget(value(args, "--target"));
 const sourceRoot = existingDirectory(value(args, "--source", false), "Source");
 const timeBudget = positiveInteger(value(args, "--time-budget", false), "Time budget", 15, 30);
-const actionBudget = positiveInteger(value(args, "--action-budget", false), "Action budget", 20, 40);
+const actionBudget = positiveInteger(value(args, "--action-budget", false), "Action budget", 20, 60);
 const description = descriptionValue(args);
 const flagRegex = flagRegexValue(args);
 const projectRoot = process.env.CTFC_PROJECT_ROOT ? resolve(process.env.CTFC_PROJECT_ROOT) : process.cwd();
@@ -122,6 +123,7 @@ const record = {
   source_root: sourceRoot,
   time_budget: timeBudget,
   action_budget: actionBudget,
+  insecure_tls: insecureTls,
   flag_regex: flagRegex,
   paths,
 };

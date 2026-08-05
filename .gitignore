@@ -41,3 +41,4 @@ results/validation/
 
 # Private competition runtime records
 .ctf-c/competition-runs/
+.ctf-c/replay-output/

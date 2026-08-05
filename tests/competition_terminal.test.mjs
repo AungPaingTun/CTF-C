@@ -39,11 +39,17 @@ export default function (pi) {
       process.env.CTFC_COMPETITION_RUN_RECORD = secondRecordPath;
       initializeCompetitionRun();
       const expired = state(secondRecord);
-      expired.deadline_at = Date.now() - 1;
-      writeFileSync(secondRecord.paths.state, `${JSON.stringify(expired)}\n`);
-      const timeoutResult = await call("finalize_result", { status: "timeout", reason_code: "deadline_reached" });
-      assert.equal(timeoutResult.status, "timeout");
-      assert.equal(JSON.parse(readFileSync(secondRecord.paths.result, "utf8")).status, "timeout");
+       expired.reasoning = { current_hypothesis: "The timeout fixture still has a testable route.", confidence: 0.5, supporting_evidence: ["The fixture target is available."], untested_experiments: ["Request the fixture root."], tested_experiments: [] };
+       writeFileSync(secondRecord.paths.state, `${JSON.stringify(expired)}\n`);
+       initializeCompetitionRun();
+       await assert.rejects(() => call("finalize_result", { status: "timeout", reason_code: "deadline_reached" }), /untested experiment remains/);
+       expired.deadline_at = Date.now() - 1;
+       writeFileSync(secondRecord.paths.state, `${JSON.stringify(expired)}\n`);
+       initializeCompetitionRun();
+       const timeoutResult = await call("finalize_result", { status: "timeout", reason_code: "deadline_reached" });
+       assert.equal(timeoutResult.status, "timeout");
+       assert.equal(JSON.parse(readFileSync(secondRecord.paths.result, "utf8")).status, "timeout");
+       assert.equal(state(secondRecord).status, "timeout");
       for (const resultPath of [record.paths.result, secondRecord.paths.result]) {
         const result = readFileSync(resultPath, "utf8");
         assert.doesNotMatch(result, /picoCTF\{/);

@@ -1,0 +1,71 @@
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import test from "node:test";
+
+const root = process.cwd();
+const starter = join(root, "scripts", "start_competition_pi.sh");
+
+test("interactive starter uses the proven Pi configuration from the project root", () => {
+  const temp = mkdtempSync(join(tmpdir(), "ctf-c-starter-test-"));
+  const argsPath = join(temp, "args.txt");
+  const cwdPath = join(temp, "cwd.txt");
+  const fakePi = join(temp, "pi");
+  writeFileSync(fakePi, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsPath}"\nprintf '%s' "$PWD" > "${cwdPath}"\n`);
+  chmodSync(fakePi, 0o755);
+  try {
+    const result = spawnSync(starter, { cwd: temp, env: { ...process.env, PATH: `${temp}:${process.env.PATH}` }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "Paste one Web CTF challenge with exactly one target URL.\nOptional source: include its absolute path from Downloads in the same message.\nFirst request the target root. Then inspect supplied source once, read the most relevant discovered files, and return to evidence-backed HTTP testing as soon as an exploit primitive is found.\n");
+    assert.equal(readFileSync(cwdPath, "utf8"), root);
+     const args = readFileSync(argsPath, "utf8");
+     for (const flag of ["--no-builtin-tools", "--offline", "--no-session", "--approve", "--provider", "opencode-go", "--model", "deepseek-v4-pro", "--thinking", "off"]) assert.match(args, new RegExp(`^${flag.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")}$`, "m"));
+     const lines = args.trimEnd().split("\n");
+     const promptIndex = lines.indexOf("--append-system-prompt");
+     assert.notEqual(promptIndex, -1, "interactive starter did not pass --append-system-prompt");
+     const contract = lines[promptIndex + 1];
+     assert.match(contract, /Direct 15-minute Web solve/);
+     assert.match(contract, /first successful HTTP action must be GET \/ with action_kind recon and timeout_ms 5000/);
+     assert.match(contract, /Preserve cookie state/);
+     assert.match(contract, /Before every HTTP action/);
+     assert.match(contract, /do not repeat equivalent experiments/);
+      assert.match(contract, /Authentication or session evidence means prioritize observed redirects, cookies, links, forms, comments, source clues, and authenticated routes/);
+      assert.match(contract, /EXPLOIT COMPLETION: When retained evidence strongly supports a concrete exploit primitive/);
+      assert.match(contract, /complete the smallest evidence-backed chain: discovery -> validate -> exploit -> verify/);
+      assert.match(contract, /For deterministic transformations such as MD5, use compute_digest only in an observed route or parameter family/);
+      assert.match(contract, /If a job is triggered, reserve enough actions to poll, retrieve, and call verify_flag/);
+      assert.match(contract, /DECISION LOOP: After root reconnaissance and every meaningful response/);
+      assert.match(contract, /observed multipart file form means submit one evidence-backed multipart request first/);
+      assert.match(contract, /For an observed multipart form with no hidden inputs, omit multipart\.evidence_form_fields; source evidence plus the observed file field is sufficient/);
+       assert.match(contract, /source_evidence_id is the page containing the observed form; submit multipart POST to that form observed action path/);
+       assert.match(contract, /submit multipart POST to that form observed action path, use method POST, and use action_kind exactly submit/);
+       assert.match(contract, /Classify deterministic unavailable or unconfigured capabilities as Unavailable Capability/);
+      assert.match(contract, /\[UNAVAILABLE_CAPABILITY\]/);
+      assert.match(contract, /Distinguish DNS failure, connection refused, timeout, TLS failure, HTTP response, redirect, and application error/);
+       assert.match(contract, /Rank evidence as authenticated response > server-generated metadata > redirect targets > HTML forms > comments > headers > error messages > timing > speculation/);
+       assert.match(contract, /Derive unknown identifiers, object references, filenames, tokens, nonces, keys, UUIDs, and predictable paths from retained evidence/);
+      assert.match(contract, /small bounded number of independent attempts/);
+       assert.match(contract, /After contradiction, retire the hypothesis and promote the strongest evidence-backed alternative/);
+       assert.match(contract, /chain: discovery -> validate -> exploit -> verify/);
+       assert.match(contract, /maintain exactly one primary Web hypothesis and one backup hypothesis/);
+       assert.match(contract, /Prefer protected data, the missing parameter, or likely flag-bearing evidence over more confidence-building or unrelated testing/);
+      assert.match(contract, /Confirmed server-side template evaluation means perform minimum confirmation then prioritize extraction/);
+      assert.match(contract, /An observed dynamic object route or predictable identifier transformation means identify the invariant route family/);
+      assert.match(contract, /derive candidates only from retained evidence or a confirmed deterministic transform using compute_digest/);
+      assert.match(contract, /Authentication or session evidence means prioritize observed redirects, cookies, links, forms, comments, source clues, and authenticated routes/);
+      assert.match(contract, /An error, status, or body differential suggesting injection or parser behavior means use the smallest differential confirmation then prioritize extraction/);
+      assert.match(contract, /After retained WASM or binary evidence, inspect that exact evidence with inspect_evidence using wasm_summary, strings, or hex before any additional HTTP request/);
+      assert.match(contract, /derive private evidence and use normal verify_flag; do not brute-force keys or execute the artifact/);
+      assert.match(contract, /wasm_summary, strings, or hex/);
+     assert.match(contract, /Inspect required evidence checkpoints/);
+     assert.match(contract, /Verify flags only from retained evidence/);
+     assert.match(contract, /finalize safely with not_solved/);
+     assert.doesNotMatch(contract, /https?:\/\//);
+     assert.doesNotMatch(args, /--tools|--target|--description|--description-file/);
+    assert.doesNotMatch(readFileSync(starter, "utf8"), /run_competition\.sh/);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
