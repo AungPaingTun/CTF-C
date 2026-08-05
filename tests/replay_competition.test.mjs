@@ -205,7 +205,7 @@ test("summary is derived from public artifacts and has the required schema", () 
     startedAt: 1000,
     finishedAt: 2500,
   });
-   assert.deepEqual(Object.keys(summary), ["run_id", "fixture", "started_at", "finished_at", "duration_ms", "terminal_status", "verified", "verified_flag_sha256", "actions_total", "http_actions", "websocket_actions", "websocket_evidence_derived", "tool_actions", "analysis_actions", "tool_errors", "repeated_action_rejections", "evidence_count", "model", "provider", "failure_class", "failure_detail"]);
+   assert.deepEqual(Object.keys(summary), ["run_id", "fixture", "started_at", "finished_at", "duration_ms", "terminal_status", "verified", "verified_flag_sha256", "actions_total", "http_actions", "websocket_actions", "websocket_evidence_derived", "tool_actions", "analysis_actions", "tool_errors", "repeated_action_rejections", "evidence_count", "model", "provider", "failure_class", "failure_detail", "exploration_budget_used", "exploration_budget_remaining"]);
   assert.equal(summary.terminal_status, "solved");
   assert.equal(summary.verified, true);
   assert.equal(summary.duration_ms, 1500);

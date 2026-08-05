@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { competitionTools, extractCompetitionTarget } from "../.pi/extensions/ctf-c-stage2-core.mjs";
 
-const expectedTools = ["http_request", "websocket_exchange", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"];
+const expectedTools = ["http_request", "websocket_exchange", "browser_action", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"];
 const inputRoot = mkdtempSync(join(tmpdir(), "ctf-c-competition-input-root-"));
 const inputFile = join(inputRoot, "app.py");
 writeFileSync(inputFile, "print('automatic source')\n");
@@ -52,14 +52,16 @@ export default function (pi) {
     const state = JSON.parse(readFileSync(record.paths.state, "utf8"));
     assert.equal(state.status, "active");
     assert.deepEqual(new Set(pi.getActiveTools()), new Set(expectedTools));
-    assert.equal(pi.getActiveTools().includes("start_competition_run"), false);
+    assert.equal(pi.getActiveTools().includes("start_competition_run"), true);
     assert.equal(pi.getActiveTools().includes("read"), false);
     assert.equal(pi.getActiveTools().includes("bash"), false);
     assert.equal(pi.getActiveTools().includes("edit"), false);
     assert.equal(pi.getActiveTools().includes("write"), false);
     assert.equal(competitionTools.some((tool) => tool.name === "start_competition_run"), true);
     const startTool = competitionTools.find((tool) => tool.name === "start_competition_run");
-    await assert.rejects(() => startTool.execute("duplicate-start", { challenge_text: challenge }), /already active/);
+    const sameRun = await startTool.execute("same-start", { challenge_text: challenge, target_url: "http://127.0.0.1:9/login" });
+    assert.equal(sameRun.details.reused, true);
+    await assert.rejects(() => startTool.execute("mismatched-target", { challenge_text: challenge, target_url: "http://127.0.0.1:10/login" }), /match the extracted challenge target/);
     delete process.env.CTFC_COMPETITION_INPUT_ROOTS;
     rmSync(inputRoot, { recursive: true, force: true });
     pi.shutdown();

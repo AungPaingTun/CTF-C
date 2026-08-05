@@ -35,7 +35,7 @@ export default function (pi) {
 
   const fakePi = join(temp, "pi");
   const fakeOutput = join(temp, "pi-args.txt");
-   writeFileSync(fakePi, `#!/bin/sh\nprintf '%s\\n' "$@" > "${fakeOutput}"\nprintf 'cwd=%s\\n' "$PWD" >> "${fakeOutput}"\nprintf 'record=%s\\n' "$CTFC_COMPETITION_RUN_RECORD" >> "${fakeOutput}"\nCTFC_SURFACE_OUTPUT="${fakeOutput}" exec "${realPi}" --mode rpc --no-builtin-tools --offline --no-session --approve -e "${surfaceTest}" <<'EOF'\n{"id":"state","type":"get_state"}\nEOF\n`);
+   writeFileSync(fakePi, `#!/bin/sh\nfor arg do [ "$arg" = "--list-models" ] && exit 0; done\nprintf '%s\\n' "$@" > "${fakeOutput}"\nprintf 'cwd=%s\\n' "$PWD" >> "${fakeOutput}"\nprintf 'record=%s\\n' "$CTFC_COMPETITION_RUN_RECORD" >> "${fakeOutput}"\nCTFC_SURFACE_OUTPUT="${fakeOutput}" exec "${realPi}" --mode rpc --no-builtin-tools --offline --no-session --approve -e "${surfaceTest}" <<'EOF'\n{"id":"state","type":"get_state"}\nEOF\n`);
   chmodSync(fakePi, 0o755);
    const defaultLaunch = spawnSync(launcher, ["--target", "http://example.test:8080", "--approve"], {
      cwd: temp,
@@ -56,19 +56,30 @@ export default function (pi) {
     assert.match(output, /--offline/);
     assert.match(output, /--no-session/);
     assert.match(output, /--approve/);
-     assert.match(output, /--tools\nhttp_request,websocket_exchange,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
+     assert.match(output, /--tools\nhttp_request,websocket_exchange,browser_action,start_competition_run,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
     assert.match(output, /--provider\nopencode-go/);
     assert.match(output, /--model\ndeepseek-v4-pro/);
     assert.match(output, /--thinking\noff/);
    assert.match(output, new RegExp(`cwd=${root.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")}`));
-       assert.match(output, /tools=http_request,websocket_exchange,start_competition_run,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
+       assert.match(output, /tools=http_request,websocket_exchange,browser_action,start_competition_run,inspect_evidence,list_source,read_source,search_source,compute_digest,derive_binary_evidence,run_local_command,replace_session_cookie,adopt_session_cookie,verify_flag,finalize_result/);
      assert.match(output, /Derive a specific hypothesis from retained evidence before each request/);
      assert.match(output, /Mutate an observed route before unrelated endpoints/);
      assert.match(output, /Authentication or session evidence means prioritize observed redirects, cookies, links, forms, comments, and authenticated routes/);
       assert.match(output, /Before starting a fresh multi-step branch, check the remaining time and action budget/);
       assert.match(output, /For a deterministic identifier transformation such as MD5, use compute_digest before hypothesis-route requests/);
       assert.match(output, /DECISION LOOP: After root reconnaissance and every meaningful response/);
-      assert.match(output, /Maintain exactly one primary hypothesis and one backup hypothesis/);
+      assert.match(output, /Maintain the ranked hypothesis board as authoritative/);
+      assert.match(output, /If the user pastes a CTF challenge with a target URL that differs from the currently bound origin/);
+      assert.match(output, /call start_competition_run before any HTTP request/);
+      assert.match(output, /Do not call finalize_result between successive challenges/);
+      assert.match(output, /After root reconnaissance and every meaningful response/);
+      assert.match(output, /HYPOTHESIS BOARD/);
+      assert.match(output, /up to 3 ranked active hypotheses/);
+      assert.match(output, /The rank-1 hypothesis is the authoritative primary/);
+      assert.match(output, /After two failed experiments testing the same family\+branch/);
+      assert.match(output, /retire or pivot that hypothesis/);
+      assert.match(output, /Do not repeat a retired family\+branch experiment/);
+      assert.match(output, /board is the single source of truth/i);
       assert.match(output, /Before starting a fresh multi-step branch, check the remaining time and action budget/);
       assert.match(output, /observed multipart file form means submit one evidence-backed multipart request first/);
        assert.match(output, /When a multipart form has no hidden inputs, omit multipart\.evidence_form_fields; source evidence plus the observed file field is sufficient/);
@@ -124,7 +135,7 @@ export default function (pi) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   process.env.CTFC_STAGE2_TEST_MODE = "local-fixture";
-    assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "websocket_exchange", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"]);
+    assert.deepEqual(competitionTools.map((tool) => tool.name), ["http_request", "websocket_exchange", "browser_action", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"]);
    const httpTool = competitionTools.find((tool) => tool.name === "http_request");
    const digestTool = competitionTools.find((tool) => tool.name === "compute_digest");
    const verifyTool = competitionTools.find((tool) => tool.name === "verify_flag");
@@ -140,7 +151,7 @@ export default function (pi) {
      assert.equal(digest.details.digest, "a3e323ed331169673938b48c8b2967f9");
      assert.doesNotMatch(JSON.stringify(digest.details), /launcher-safe-input/);
      assert.equal(localRecord.source_root, null, "digest test unexpectedly requires a source root");
-     const result = await httpTool.execute(`direct-action-${name}`, { method: "GET", path: `/${name}`, action_kind: "recon", timeout_ms: 2000, reasoning: { evidence_summary: ["The local launcher fixture exposes the requested flag route."], leading_hypothesis: `The route /${name} contains the configured flag.`, supporting_evidence: ["The route is provided by the local fixture."], experiment: `GET /${name} configured-flag request`, expected_observation: "The response contains the configured flag.", confidence: 0.8, untested_experiments: [] } });
+     const result = await httpTool.execute(`direct-action-${name}`, { method: "GET", path: `/${name}`, action_kind: "recon", timeout_ms: 2000, reasoning: { evidence_summary: ["The local launcher fixture exposes the requested flag route."], leading_hypothesis: `The route /${name} contains the configured flag.`, supporting_evidence: ["The route is provided by the local fixture."], experiment: `GET /${name} configured-flag request`, expected_observation: "The response contains the configured flag.", confidence: 0.8, untested_experiments: [], exploration_score: 0.8, exploration_justification: "The configured fixture route is the explicit test target." } });
     assert.ok(result.details?.evidence_id, "first typed action did not produce evidence");
     const verified = await verifyTool.execute(`verify-${name}`, { evidence_id: result.details.evidence_id });
     assert.equal(verified.details?.flag, configured.value, `configured ${name} flag was not verified`);

@@ -8,7 +8,7 @@ import { startP11InvalidTlsFixture } from "./fixtures/p11-invalid-tls.mjs";
 
 const httpTool = competitionTools.find((tool) => tool.name === "http_request");
 const finishTool = competitionTools.find((tool) => tool.name === "finalize_result");
-const reasoning = (path) => ({ evidence_summary: ["The local TLS fixture is the authorized target."], leading_hypothesis: "The authorized origin should return its local TLS fixture response.", supporting_evidence: ["The target is the exact loopback origin under test."], experiment: `GET ${path}`, expected_observation: "A transport classification or HTTP response is retained.", confidence: 0.5, untested_experiments: [] });
+const reasoning = (path) => ({ evidence_summary: ["The local TLS fixture is the authorized target."], leading_hypothesis: "The authorized origin should return its local TLS fixture response.", supporting_evidence: ["The target is the exact loopback origin under test."], experiment: `GET ${path}`, expected_observation: "A transport classification or HTTP response is retained.", confidence: 0.5, untested_experiments: [], exploration_score: 0.5, exploration_justification: "The local TLS fixture explicitly defines this bounded transport probe." });
 
 function newRecord(origin, insecure) {
   return execFileSync(process.execPath, ["scripts/create_competition_run.mjs", "--target", origin, "--approve", "--description", "local P11 TLS fixture", "--time-budget", "1", "--action-budget", "8", ...(insecure ? ["--allow-insecure-tls"] : [])], { encoding: "utf8", env: { ...process.env, CTFC_PROJECT_ROOT: process.cwd() } }).trim();

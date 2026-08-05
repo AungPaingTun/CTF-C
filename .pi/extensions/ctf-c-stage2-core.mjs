@@ -22,6 +22,7 @@ const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const MAX_HEADERS = 32;
 const MAX_HEADER_BYTES = 16 * 1024;
 const MAX_BODY = 1024 * 1024;
+const MAX_RAW_XML = 256 * 1024;
 const MAX_INSPECT = 4096;
 const MAX_TIMEOUT = 10000;
 const MIN_TIMEOUT = 250;
@@ -49,15 +50,28 @@ const TERMINAL_STATUSES = new Set(["not_solved", "timeout", "action_budget_exhau
 const DEFAULT_FLAG_REGEX = "picoCTF\\{[^}\\r\\n]{1,256}\\}";
 const MAX_REASONING_TEXT = 512;
 const MAX_REASONING_ITEMS = 5;
-const MAX_HYPOTHESIS_ROUTES = 3;
-const DIGEST_ALGORITHMS = new Set(["md5", "sha1", "sha256"]);
+const DEFAULT_EXPLORATION_BUDGET = 5;
+const ROUTE_FAMILIES = new Set(["source", "api", "auth", "upload", "admin", "debug", "public", "other"]);
+const HYPOTHESIS_FAMILIES = new Set(["auth_bypass", "idor", "ssti", "injection", "source_disclosure", "upload_execution", "protocol_transition", "unknown"]);
+const HYPOTHESIS_BRANCHES = new Set(["confirmation", "extraction", "privilege_boundary"]);
+const MAX_ACTIVE_HYPOTHESES = 3;
+const HYPOTHESIS_MIN_CONFIDENCE = 0.2;
+const HYPOTHESIS_MAX_FAILURES = 2;
+const DIGEST_ALGORITHMS = new Set(["md5", "sha1", "sha256", "base64_encode", "base64_decode"]);
+const DERIVATION_OPERATIONS = new Set(["base64_decode", "url_decode", "hex_decode", "xor_repeat", "concat"]);
+const MAX_DERIVATION_BYTES = 64 * 1024;
 const MAX_DIGEST_TEXT_BYTES = 4096;
 const MAX_DIGEST_PURPOSE = 256;
 const UNAVAILABLE_CAPABILITY_MARKER = "[UNAVAILABLE_CAPABILITY]";
-const COMPETITION_TOOL_NAMES = ["http_request", "websocket_exchange", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"];
+const COMPETITION_TOOL_NAMES = ["http_request", "websocket_exchange", "browser_action", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"];
 let activeRun;
 let extensionApi;
 let lastUserChallenge;
+let watchdogTimer;
+let browserContext;
+let browserPage;
+let browserOrigin;
+let browserInstance;
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const RUNTIME_FILES = [".pi/extensions/ctf-c-stage2-core.mjs", "scripts/start_competition_pi.sh", "scripts/run_competition.sh"];
@@ -150,25 +164,28 @@ function createRunRecord({ targetOrigin, description, timeBudget, actionBudget, 
 }
 async function startCompetitionRun(params, trustedText = null) {
   retireExpiredRun();
-  if (activeRun?.status === "active") throw new Error("A competition run is already active");
   if (typeof params.challenge_text !== "string" || !params.challenge_text.trim()) throw new Error("Challenge text is required");
   if (trustedText !== null && params.challenge_text !== trustedText) throw new Error("Challenge text must match the pasted user message");
   if (trustedText === null && (!lastUserChallenge || params.challenge_text !== lastUserChallenge)) throw new Error("Challenge text must come from the pasted user message");
   const text = params.challenge_text;
   if (!/\b(?:ctf|picoctf|challenge|flag|capture[\s-]*the[\s-]*flag)\b/i.test(text)) throw new Error("Message does not meet challenge activation criteria");
   const target = extractCompetitionTarget(text);
+  if (params.target_url !== undefined && (typeof params.target_url !== "string" || params.target_url !== target.candidate)) throw new Error("target_url must match the extracted challenge target");
+  if (activeRun?.status === "active" && activeRun.target_origin === target.origin) return { run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, time_budget: activeRun.time_budget, action_budget: activeRun.action_budget, reused: true };
   const timeBudget = validateRunOption(params.time_budget_minutes, 15, "Time budget", 30);
   const actionBudget = validateRunOption(params.action_budget, trustedText !== null ? 60 : 20, "Action budget", 60);
   const flagRegex = params.flag_regex ?? DEFAULT_FLAG_REGEX;
   compileFlagRegex(flagRegex);
   const recordPath = await createRunRecord({ targetOrigin: target.origin, description: text, timeBudget, actionBudget, flagRegex });
   ingestCompetitionInputs(recordPath, text);
+  if (activeRun?.status === "active" && activeRun.target_origin !== target.origin) activeRun = null;
   process.env.CTFC_COMPETITION_RUN_RECORD = recordPath;
   initializeCompetitionRun();
   extensionApi?.setActiveTools(COMPETITION_TOOL_NAMES);
   return { run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, time_budget: activeRun.time_budget, action_budget: activeRun.action_budget };
 }
 function sanitize(value, limit = MAX_INSPECT) {
+  // Public previews are redacted; private evidence remains the verification source.
   const flagPattern = activeRun?.flagPattern;
   const htmlRedacted = String(value).replace(/<(input|textarea|select|button)\b[^>]*>/gi, (tag) => {
     const name = attr(tag, "name");
@@ -193,7 +210,13 @@ function reasoningParams(value) {
     return sanitize(value[name], MAX_REASONING_TEXT);
   };
   if (!Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1) throw new Error("Invalid reasoning confidence");
-  return { evidence_summary: list("evidence_summary"), leading_hypothesis: text("leading_hypothesis"), supporting_evidence: list("supporting_evidence"), experiment: text("experiment"), expected_observation: text("expected_observation"), confidence: value.confidence, untested_experiments: list("untested_experiments", false) };
+  const explorationScore = value.exploration_score;
+  if (explorationScore !== undefined && (!Number.isFinite(explorationScore) || explorationScore < 0 || explorationScore > 1)) throw new Error("Invalid exploration score");
+  const explorationJustification = value.exploration_justification === undefined ? "" : text("exploration_justification");
+  const routeFamily = value.route_family === undefined ? "other" : String(value.route_family);
+  if (!ROUTE_FAMILIES.has(routeFamily)) throw new Error("Invalid route family");
+  const nextExperiment = value.next_experiment === undefined ? "" : text("next_experiment");
+  return { evidence_summary: list("evidence_summary"), leading_hypothesis: text("leading_hypothesis"), supporting_evidence: list("supporting_evidence"), experiment: text("experiment"), expected_observation: text("expected_observation"), confidence: value.confidence, untested_experiments: list("untested_experiments", false), exploration_score: explorationScore, exploration_justification: explorationJustification, route_family: routeFamily, next_experiment: nextExperiment };
 }
 function reasoningFingerprint(request) {
   return hash(JSON.stringify({ hypothesis: request.reasoning.leading_hypothesis, experiment: request.reasoning.experiment })).slice(0, 24);
@@ -228,8 +251,130 @@ function updateReasoning(request, statusCode, outcome, error = "") {
       : statusCode >= 400
         ? Math.max(0, before - 0.15)
         : before;
-  activeRun.reasoning = { current_hypothesis: request.reasoning.leading_hypothesis, confidence: after, supporting_evidence: request.reasoning.supporting_evidence, untested_experiments: request.reasoning.untested_experiments, tested_experiments: [...activeRun.reasoning.tested_experiments, reasoningFingerprint(request)].slice(-128), transport_class: transportClass, transport_observations: [...(activeRun.reasoning.transport_observations ?? []), { class: transportClass, fingerprint: reasoningFingerprint(request) }].slice(-64) };
+  activeRun.reasoning = { current_hypothesis: request.reasoning.leading_hypothesis, confidence: after, supporting_evidence: request.reasoning.supporting_evidence, untested_experiments: request.reasoning.untested_experiments, next_experiment: request.reasoning.next_experiment, tested_experiments: [...activeRun.reasoning.tested_experiments, reasoningFingerprint(request)].slice(-128), transport_class: transportClass, transport_observations: [...(activeRun.reasoning.transport_observations ?? []), { class: transportClass, fingerprint: reasoningFingerprint(request) }].slice(-64) };
   return { ...request.reasoning, confidence_after: after };
+}
+function evidenceTierForBoard(statusCode, outcome, body) {
+  const text = typeof body === "string" ? body.slice(0, 4096) : (Buffer.isBuffer(body) ? body.toString("utf8").slice(0, 4096) : "");
+  if (statusCode >= 200 && statusCode < 300) return activeRun.cookies.size > 0 || /login|session|auth/i.test(text) ? "authenticated_response" : /<form/i.test(text) ? "html_forms" : /<!--/.test(text) ? "comments" : "html_forms";
+  if (statusCode >= 300 && statusCode < 400) return "redirect_targets";
+  if (statusCode >= 500) return "server_metadata";
+  if (statusCode >= 400) return "error_messages";
+  if (outcome === "timeout" || outcome === "error") return "timing";
+  return "speculation";
+}
+const TIER_SCORES = { authenticated_response: 1.0, server_metadata: 0.8, redirect_targets: 0.7, html_forms: 0.6, comments: 0.5, headers: 0.4, error_messages: 0.3, timing: 0.2, speculation: 0.1 };
+function tierScore(tier) { return TIER_SCORES[tier] ?? 0.1; }
+function initializeHypothesisBoard() {
+  if (!activeRun.hypothesisBoard) activeRun.hypothesisBoard = [];
+  if (!activeRun.retiredHypotheses) activeRun.retiredHypotheses = [];
+  if (!activeRun.familyBranchFailures) activeRun.familyBranchFailures = {};
+  const active = activeRun.hypothesisBoard.filter((h) => !h.retired);
+  if (active.length === 0 && activeRun.evidenceRecords.size > 0 && activeRun.hypothesisBoard.length === 0) spawnUnknownHypothesis();
+}
+function classifyFamily(text) {
+  const lower = text.toLowerCase();
+  if (/auth|bypass|login|session|credential|password|token/.test(lower)) return "auth_bypass";
+  if (/idor|direct.object|reference|access.control/.test(lower)) return "idor";
+  if (/ssti|template|jinja|twig|mustache|render/.test(lower)) return "ssti";
+  if (/sql|injection|xss|command|os.inject|code.exec/.test(lower)) return "injection";
+  if (/source|disclosure|leak|expos|\.git|\.env|config/.test(lower)) return "source_disclosure";
+  if (/upload|file.exec|shell.upload/.test(lower)) return "upload_execution";
+  if (/websocket|protocol|transition|upgrade/.test(lower)) return "protocol_transition";
+  return "unknown";
+}
+function classifyBranch(experiment) {
+  const lower = experiment.toLowerCase();
+  if (/extract|dump|read|steal|retrieve|download/.test(lower)) return "extraction";
+  if (/privilege|admin|escalat|role|elevat/.test(lower)) return "privilege_boundary";
+  return "confirmation";
+}
+function findBoardHypothesis(leadingHypothesis) {
+  const family = classifyFamily(leadingHypothesis);
+  const summary = leadingHypothesis.slice(0, 64).toLowerCase();
+  return activeRun.hypothesisBoard.find((h) => !h.retired && (h.family === family || h.summary.toLowerCase().includes(summary) || summary.includes(h.summary.toLowerCase())));
+}
+function capHypotheses() {
+  const active = activeRun.hypothesisBoard.filter((h) => !h.retired);
+  while (active.length > MAX_ACTIVE_HYPOTHESES) {
+    const weakest = active.sort((a, b) => a.confidence - b.confidence)[0];
+    weakest.retired = true;
+    weakest.retired_reason = "capped at 3 active hypotheses";
+    activeRun.retiredHypotheses.push({ ...weakest });
+    activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((h) => h.id !== weakest.id);
+    const idx = active.indexOf(weakest);
+    if (idx >= 0) active.splice(idx, 1);
+  }
+}
+function promoteHypotheses() {
+  const active = activeRun.hypothesisBoard.filter((h) => !h.retired).sort((a, b) => b.confidence - a.confidence);
+  for (let i = 0; i < active.length; i += 1) active[i].rank = i + 1;
+}
+function hypothesisBoardSummary() {
+  const active = (activeRun?.hypothesisBoard ?? []).filter((h) => !h.retired);
+  if (!active.length) return [];
+  return active.map((h) => ({ id: h.id, rank: h.rank, family: h.family, branch: h.branch, confidence: Math.round(h.confidence * 100) / 100, summary: h.summary, next_experiment: h.next_experiment, supporting_count: h.supporting_evidence_ids.length, disconfirming_count: h.disconfirming_evidence_ids.length }));
+}
+function spawnUnknownHypothesis() {
+  const evidenceRecords = [...activeRun.evidenceRecords.values()];
+  if (!evidenceRecords.length) return;
+  const bestEvidence = evidenceRecords.filter((item) => item.record.tool === "http_request" && item.record.status_code >= 200 && item.record.status_code < 300).sort((a, b) => (b.record.sequence ?? 0) - (a.record.sequence ?? 0))[0]
+    ?? evidenceRecords.filter((item) => item.record.tool === "http_request").sort((a, b) => (b.record.sequence ?? 0) - (a.record.sequence ?? 0))[0];
+  if (!bestEvidence) return;
+  const evidenceId = bestEvidence.record.evidence_id;
+  let bodyText = "";
+  try { bodyText = evidenceFor(evidenceId).body.toString("utf8").slice(0, 4096); } catch {}
+  const links = bodyText ? [...bodyText.matchAll(/href\s*=\s*(?:"([^"]+)"|'([^']+)')/gi)].slice(0, 3).map((m) => normalizeCluePath(m[1] ?? m[2])) : [];
+  const forms = bodyText ? [...bodyText.matchAll(/<form\b[^>]*action\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)].slice(0, 3).map((m) => ({ path: normalizeCluePath(m[1] ?? m[2]), method: "GET" })) : [];
+  let next = "";
+  if (links[0]) next = `GET ${links[0]}`;
+  else if (forms[0]) next = `${forms[0].method} ${forms[0].path}`;
+  const id = `h${(activeRun.hypothesisBoard?.length ?? 0) + (activeRun.retiredHypotheses?.length ?? 0) + 1}`;
+  activeRun.hypothesisBoard.push({ id, rank: 1, family: "unknown", summary: "spawned from strongest retained evidence", supporting_evidence_ids: [evidenceId], confidence: 0.4, next_experiment: next, disconfirming_evidence_ids: [], estimated_action_cost: 1, branch: "confirmation", retired: false, retired_reason: null });
+}
+function updateHypothesisBoard(reasoning, evidenceId, statusCode, outcome, body) {
+  initializeHypothesisBoard();
+  const tier = evidenceTierForBoard(statusCode, outcome, body);
+  const weight = tierScore(tier);
+  if (!reasoning?.leading_hypothesis) return;
+  const leadingHypothesis = reasoning.leading_hypothesis;
+  const confidence = reasoning.confidence_after ?? reasoning.confidence ?? 0.5;
+  const experiment = reasoning.experiment ?? "";
+  const nextExperiment = reasoning.next_experiment ?? "";
+  const family = classifyFamily(leadingHypothesis);
+  const branch = classifyBranch(experiment);
+  let h = findBoardHypothesis(leadingHypothesis);
+  if (!h) {
+    const id = `h${activeRun.hypothesisBoard.length + activeRun.retiredHypotheses.length + 1}`;
+    h = { id, rank: activeRun.hypothesisBoard.filter((x) => !x.retired).length + 1, family, summary: leadingHypothesis.slice(0, 128), supporting_evidence_ids: [], confidence: 0.5, next_experiment: "", disconfirming_evidence_ids: [], estimated_action_cost: 1, branch, retired: false, retired_reason: null };
+    activeRun.hypothesisBoard.push(h);
+  }
+  const success = statusCode >= 200 && statusCode < 300;
+  const failure = !success && (outcome === "error" || outcome === "timeout" || statusCode >= 400);
+  const adjustment = success ? 0.1 * weight : failure ? -0.12 * weight : 0;
+  h.confidence = Math.max(0, Math.min(1, h.confidence + adjustment));
+  if (adjustment > 0) { h.supporting_evidence_ids = [...new Set([...h.supporting_evidence_ids, evidenceId])].slice(-32); }
+  else if (adjustment < 0) { h.disconfirming_evidence_ids = [...new Set([...h.disconfirming_evidence_ids, evidenceId])].slice(-32); }
+  h.summary = leadingHypothesis.slice(0, 128);
+  if (nextExperiment) h.next_experiment = nextExperiment;
+  h.branch = branch;
+  const fbKey = `${family}:${branch}`;
+  activeRun.familyBranchFailures[fbKey] = (activeRun.familyBranchFailures[fbKey] ?? 0) + (failure ? 1 : 0);
+  if (success) activeRun.familyBranchFailures[fbKey] = 0;
+  if (h.confidence < HYPOTHESIS_MIN_CONFIDENCE) {
+    h.retired = true;
+    h.retired_reason = `confidence ${h.confidence.toFixed(2)} below threshold`;
+    activeRun.retiredHypotheses.push({ ...h });
+    activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((bh) => bh.id !== h.id);
+  } else if (activeRun.familyBranchFailures[fbKey] >= HYPOTHESIS_MAX_FAILURES && h.supporting_evidence_ids.length < 2) {
+    h.retired = true;
+    h.retired_reason = `two failed ${family}/${branch} experiments without new evidence`;
+    activeRun.retiredHypotheses.push({ ...h });
+    activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((bh) => bh.id !== h.id);
+  }
+  capHypotheses();
+  promoteHypotheses();
+  persistState();
 }
 function headersForEvidence(headers) {
   const result = {};
@@ -396,7 +541,10 @@ function evidenceRouteClues() {
     const inspected = inspectHtml(body, baseUrl);
     for (const link of inspected.links) add(link, "an observed link", baseUrl);
     for (const form of inspected.forms) add(form.action, "an observed form", baseUrl);
-    for (const script of inspected.scripts) add(script.src, "an observed script", baseUrl);
+    for (const script of inspected.scripts) {
+      add(script.src, "an observed script", baseUrl);
+      for (const match of String(script.inline_excerpt ?? "").matchAll(/(?:fetch|WebSocket|location(?:\.href)?|window\.location)\s*\([^)]*?["']([^"']+)["']/gi)) add(match[1], "an observed script route", baseUrl);
+    }
     const routeToken = /(?:["'`]|\s)((?:\/(?:[A-Za-z0-9._~!$&'()*+,;=:@%{}\[\]-]+(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%{}\[\]-]+)*)|(?:[A-Za-z0-9._~-]+\/)+[A-Za-z0-9._~!$&'()*+,;=:@%{}\[\]-]+|[A-Za-z0-9._~-]+\.(?:php|html?|js|css|json|txt))(?:[?#][^"'`\s<]*)?)(?=["'`\s<])/gi;
     for (const match of body.matchAll(routeToken)) add(cleanBodyRoute(match[1]), "an observed response route", baseUrl);
   }
@@ -412,6 +560,17 @@ function sameRouteFamily(candidate, observed) {
   if (left.length === right.length) return same >= left.length - 1 && same >= 1;
   return Math.abs(left.length - right.length) === 1 && same >= length - 1 && same >= 1;
 }
+function routeFamily(path) {
+  const value = path.toLowerCase();
+  if (/\/source(?:\/|$)|\.git|\.env|config/.test(value)) return "source";
+  if (/\/api(?:\/|$)|\.json(?:$|[?#])/.test(value)) return "api";
+  if (/login|logout|auth|session|register|account/.test(value)) return "auth";
+  if (/upload|file|attachment|media/.test(value)) return "upload";
+  if (/admin|dashboard|manage/.test(value)) return "admin";
+  if (/debug|trace|test|health/.test(value)) return "debug";
+  if (/public|static|assets|robots\.txt|sitemap\.xml/.test(value)) return "public";
+  return "other";
+}
 function requestDecision(request) {
   if (activeRun.evidenceSequence === 0) return { allow: true };
   if (activeRun.hypothesisRoutePaths.has(request.path)) return { allow: false, reason: `Rejected repeated hypothesis route ${request.path}.` };
@@ -420,15 +579,29 @@ function requestDecision(request) {
   const exact = clues.find((clue) => clue.path === request.path);
   if (exact) return { allow: true };
   if (activeRun.cookies.size && request.path === "/") return { allow: true };
-  const mutation = observed.find((path) => sameRouteFamily(request.path, path));
-  if (mutation) return { allow: true };
   const explored = new Set([...activeRun.evidenceRecords.values()].map((item) => item.record.request?.path).filter(Boolean));
   const strongest = clues.find((clue) => !explored.has(clue.path));
   const clue = strongest ?? clues[0];
   const detail = clue ? `Strongest current clue: ${clue.source} at ${clue.path}.` : "No retained route clue supports this request.";
   const qualifyingHypothesis = request.method === "GET" && request.action_kind === "recon" && request.path.startsWith("/") && !request.path.startsWith("//") && request.url.origin === activeRun.target_origin && request.reasoning.leading_hypothesis.trim() && request.reasoning.supporting_evidence.length && request.reasoning.experiment.trim() && request.reasoning.expected_observation.trim();
-  if (qualifyingHypothesis && activeRun.hypothesisRoutePaths.size < MAX_HYPOTHESIS_ROUTES) return { allow: true, hypothesisPath: request.path };
-  if (qualifyingHypothesis && activeRun.hypothesisRoutePaths.size >= MAX_HYPOTHESIS_ROUTES) return { allow: false, reason: `Rejected HTTP hypothesis route ${request.path}: the per-run hypothesis route allowance is exhausted.` };
+  if (qualifyingHypothesis) {
+    const score = request.reasoning.exploration_score;
+    const justification = request.reasoning.exploration_justification;
+    if (score === undefined || !justification) return { allow: false, reason: `Rejected unknown route ${request.path}: provide exploration_score and exploration_justification.` };
+    const family = request.reasoning.route_family === "other" ? routeFamily(request.path) : request.reasoning.route_family;
+    const repeatedFamily = activeRun.exploredRouteFamilies.has(family);
+    const effectiveScore = repeatedFamily ? Math.max(0, score - 0.15) : score;
+    if (effectiveScore < 0.3 && activeRun.reasoning.current_hypothesis) return { allow: false, reason: `Rejected unknown route ${request.path}: exploration score must be at least 0.3 while an active hypothesis remains.` };
+    if (activeRun.explorationBudgetRemaining < 1) return { allow: false, reason: `Rejected unknown route ${request.path}: exploration budget is exhausted.` };
+    const exploration = { score, effectiveScore, justification, family, repeatedFamily, beforeClues: new Set(observed) };
+    activeRun.explorationBudgetUsed += 1;
+    activeRun.explorationBudgetRemaining -= 1;
+    activeRun.exploredRouteFamilies.add(family);
+    activeRun.pendingExploration = exploration;
+    activeRun.explorationLog.push({ path: request.path, score, effective_score: effectiveScore, justification, family, outcome: "reserved" });
+    persistState();
+    return { allow: true, hypothesisPath: request.path, exploration };
+  }
   return { allow: false, reason: `Rejected HTTP request to ${request.path}. ${detail}` };
 }
 
@@ -484,22 +657,49 @@ export function initializeCompetitionRun() {
   retireExpiredRun();
   if (activeRun?.status === "active" && activeRun.run_id !== record.run_id) throw new Error("A different competition run is already active");
   const state = loadState(record); const isNewRun = state.started_at == null; const startedAt = state.started_at ?? Date.now(); const deadlineAt = state.deadline_at ?? startedAt + record.time_budget * 60000;
-  activeRun = { ...record, insecure_tls: record.insecure_tls === true, status: state.status ?? "active", startedAt, deadlineAt, actionCount: state.action_count ?? 0, toolCallCount: state.tool_call_count ?? 0, analysisActionCount: state.analysis_action_count ?? 0, analysisActionFingerprints: new Set(state.analysis_action_fingerprints ?? []), hypothesisRoutePaths: new Set(state.hypothesis_route_paths ?? []), unavailableCapabilities: new Set(state.unavailable_capabilities ?? []), interactive: process.env.CTFC_COMPETITION_INTERACTIVE === "1", evidenceSequence: state.evidence_sequence ?? 0, lastEvidenceHash: state.lastEvidenceHash ?? state.last_evidence_hash ?? null, report: state.report ?? { last_progress: "Run started.", resume_from: "" }, reasoning: state.reasoning ?? { current_hypothesis: "", confidence: 0, supporting_evidence: [], untested_experiments: [], tested_experiments: [] }, evidenceRecords: state.evidenceRecords ?? new Map(), cookies: loadCookies(record), requiredEvidenceInspection: state.required_evidence_inspection ?? null, sessionMutationEvidenceId: state.session_mutation_evidence_id ?? null, verified: null };
+  if (browserContext && activeRun?.run_id !== record.run_id) void closeBrowser();
+  const explorationBudget = Number.isSafeInteger(state.exploration_budget) && state.exploration_budget > 0 ? state.exploration_budget : DEFAULT_EXPLORATION_BUDGET;
+  const explorationUsed = Number.isSafeInteger(state.exploration_budget_used) && state.exploration_budget_used >= 0 ? state.exploration_budget_used : 0;
+  activeRun = { ...record, insecure_tls: record.insecure_tls === true, status: state.status ?? "active", startedAt, deadlineAt, actionCount: state.action_count ?? 0, toolCallCount: state.tool_call_count ?? 0, analysisActionCount: state.analysis_action_count ?? 0, analysisActionFingerprints: new Set(state.analysis_action_fingerprints ?? []), hypothesisRoutePaths: new Set(state.hypothesis_route_paths ?? []), unavailableCapabilities: new Set(state.unavailable_capabilities ?? []), explorationBudget, explorationBudgetUsed: explorationUsed, explorationBudgetRemaining: Math.max(0, explorationBudget - explorationUsed), exploredRouteFamilies: new Set(state.explored_route_families ?? []), explorationLog: Array.isArray(state.exploration_log) ? state.exploration_log : [], hypothesisBoard: Array.isArray(state.hypothesis_board) ? state.hypothesis_board : [], retiredHypotheses: Array.isArray(state.retired_hypotheses) ? state.retired_hypotheses : [], familyBranchFailures: state.family_branch_failures ?? {}, interactive: process.env.CTFC_COMPETITION_INTERACTIVE === "1", evidenceSequence: state.evidence_sequence ?? 0, lastEvidenceHash: state.lastEvidenceHash ?? state.last_evidence_hash ?? null, report: state.report ?? { last_progress: "Run started.", resume_from: "" }, reasoning: state.reasoning ?? { current_hypothesis: "", confidence: 0, supporting_evidence: [], untested_experiments: [], tested_experiments: [] }, evidenceRecords: state.evidenceRecords ?? new Map(), cookies: loadCookies(record), requiredEvidenceInspection: state.required_evidence_inspection ?? null, sessionMutationEvidenceId: state.session_mutation_evidence_id ?? null, verified: null };
   retireExpiredRun();
   if (isNewRun) writeLiveLine(startedAt, "Run started");
+  scheduleWatchdog();
   persistState(); return activeRun;
 }
+function clearWatchdog() {
+  if (watchdogTimer) clearTimeout(watchdogTimer);
+  watchdogTimer = null;
+}
+function terminalResult(status, reasonCode) {
+  void closeBrowser();
+  activeRun.status = status;
+  activeRun.report.last_progress = `Terminal failure: ${status}`;
+  writeLiveLine(activeRun.startedAt, `Important milestone: terminal failure (${status})`);
+  const result = { status, run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, exploration_budget_used: activeRun.explorationBudgetUsed, exploration_budget_remaining: activeRun.explorationBudgetRemaining, hypothesis_board: hypothesisBoardSummary(), retired_hypotheses: (activeRun.retiredHypotheses ?? []).map((h) => ({ id: h.id, family: h.family, branch: h.branch, confidence: Math.round(h.confidence * 100) / 100, summary: h.summary, retired_reason: h.retired_reason })), reason_code: reasonCode, finalized_at: new Date().toISOString() };
+  atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`);
+  persistState();
+  clearWatchdog();
+  return result;
+}
+function scheduleWatchdog() {
+  clearWatchdog();
+  if (!activeRun || activeRun.status !== "active") return;
+  const remaining = Math.max(0, activeRun.deadlineAt - Date.now());
+  watchdogTimer = setTimeout(() => {
+    watchdogTimer = null;
+    if (!activeRun || activeRun.status !== "active") return;
+    terminalResult("timeout", "hard_deadline_exceeded");
+  }, remaining);
+  watchdogTimer.unref?.();
+}
 function persistState() {
-  atomicWrite(activeRun.paths.state, `${JSON.stringify({ run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, started_at: activeRun.startedAt, deadline_at: activeRun.deadlineAt, action_count: activeRun.actionCount, tool_call_count: activeRun.toolCallCount, analysis_action_count: activeRun.analysisActionCount, analysis_action_fingerprints: [...activeRun.analysisActionFingerprints], hypothesis_route_paths: [...activeRun.hypothesisRoutePaths], unavailable_capabilities: [...activeRun.unavailableCapabilities], evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, report: activeRun.report, reasoning: activeRun.reasoning, required_evidence_inspection: activeRun.requiredEvidenceInspection, session_mutation_evidence_id: activeRun.sessionMutationEvidenceId }, null, 2)}\n`);
+  activeRun.report.exploration_budget_used = activeRun.explorationBudgetUsed;
+  activeRun.report.exploration_budget_remaining = activeRun.explorationBudgetRemaining;
+  atomicWrite(activeRun.paths.state, `${JSON.stringify({ run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, started_at: activeRun.startedAt, deadline_at: activeRun.deadlineAt, action_count: activeRun.actionCount, tool_call_count: activeRun.toolCallCount, analysis_action_count: activeRun.analysisActionCount, analysis_action_fingerprints: [...activeRun.analysisActionFingerprints], hypothesis_route_paths: [...activeRun.hypothesisRoutePaths], unavailable_capabilities: [...activeRun.unavailableCapabilities], exploration_budget: activeRun.explorationBudget, exploration_budget_used: activeRun.explorationBudgetUsed, exploration_budget_remaining: activeRun.explorationBudgetRemaining, explored_route_families: [...activeRun.exploredRouteFamilies], exploration_log: activeRun.explorationLog.slice(-64), hypothesis_board: activeRun.hypothesisBoard, retired_hypotheses: activeRun.retiredHypotheses.slice(-64), family_branch_failures: activeRun.familyBranchFailures, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, report: activeRun.report, reasoning: activeRun.reasoning, required_evidence_inspection: activeRun.requiredEvidenceInspection, session_mutation_evidence_id: activeRun.sessionMutationEvidenceId }, null, 2)}\n`);
 }
 function retireExpiredRun() {
   if (!activeRun || activeRun.status !== "active" || Date.now() < activeRun.deadlineAt) return false;
-  activeRun.status = "timeout";
-  activeRun.report.last_progress = "Terminal failure: timeout";
-  writeLiveLine(activeRun.startedAt, "Important milestone: terminal failure (timeout)");
-  const result = { status: "timeout", run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, reason_code: "deadline_reached", finalized_at: new Date().toISOString() };
-  atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`);
-  persistState();
+  terminalResult("timeout", "deadline_reached");
   return true;
 }
 function ensureActive() {
@@ -536,10 +736,23 @@ function computeDigest(params) {
   if (typeof params.text !== "string" || !params.text.trim() || params.text.includes("\u0000") || Buffer.byteLength(params.text, "utf8") > MAX_DIGEST_TEXT_BYTES) throw new Error("Invalid digest text");
   if (typeof params.purpose !== "string" || !params.purpose.trim() || params.purpose.includes("\u0000") || params.purpose.length > MAX_DIGEST_PURPOSE) throw new Error("Invalid digest purpose");
   reserveAnalysisAction(analysisFingerprint("compute_digest", { algorithm: params.algorithm, text: params.text }));
-  const digest = createHash(params.algorithm).update(params.text, "utf8").digest("hex");
-  const metadata = { algorithm: params.algorithm, digest, input_bytes: Buffer.byteLength(params.text, "utf8"), input_sha256: hash(params.text), purpose_sha256: hash(params.purpose) };
-  const evidence = writeEvidence({ tool: "compute_digest", outcome: "completed", algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes, input_sha256: metadata.input_sha256, purpose_sha256: metadata.purpose_sha256, preview: JSON.stringify({ algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes }) }, JSON.stringify(metadata));
-  return { ...evidence, algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes };
+   const inputBytes = Buffer.from(params.text, "utf8");
+   if (params.algorithm === "base64_encode" || params.algorithm === "base64_decode") {
+     let transformed;
+     if (params.algorithm === "base64_encode") transformed = inputBytes.toString("base64");
+     else {
+       if (inputBytes.length > 4 * Math.ceil(MAX_DIGEST_TEXT_BYTES / 3) + 4 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(params.text)) throw new Error("Invalid base64 digest input");
+       transformed = Buffer.from(params.text, "base64").toString("utf8");
+     }
+     const outputBytes = Buffer.byteLength(transformed, "utf8");
+     const metadata = { algorithm: params.algorithm, input_bytes: inputBytes.length, input_sha256: hash(inputBytes), output_bytes: outputBytes, output_sha256: hash(transformed), purpose_sha256: hash(params.purpose) };
+     const evidence = writeEvidence({ tool: "compute_digest", outcome: "completed", ...metadata, preview: JSON.stringify({ algorithm: params.algorithm, input_bytes: inputBytes.length, output_bytes: outputBytes, output_sha256: metadata.output_sha256 }) }, JSON.stringify(metadata));
+     return { ...evidence, algorithm: params.algorithm, value: sanitize(transformed, MAX_INSPECT), input_bytes: inputBytes.length, output_bytes: outputBytes, output_sha256: metadata.output_sha256 };
+   }
+   const digest = createHash(params.algorithm).update(inputBytes).digest("hex");
+   const metadata = { algorithm: params.algorithm, digest, input_bytes: inputBytes.length, input_sha256: hash(params.text), purpose_sha256: hash(params.purpose) };
+   const evidence = writeEvidence({ tool: "compute_digest", outcome: "completed", algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes, input_sha256: metadata.input_sha256, purpose_sha256: metadata.purpose_sha256, preview: JSON.stringify({ algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes }) }, JSON.stringify(metadata));
+   return { ...evidence, algorithm: params.algorithm, digest, input_bytes: metadata.input_bytes };
 }
 function deriveBinaryEvidence(params) {
   ensureActive();
@@ -585,8 +798,23 @@ function writeEvidence(entry, body) {
     activeRun.sessionMutationEvidenceId = null;
   }
   if (entry.tool === "http_request" && isWasmArtifact(entry, bytes)) activeRun.requiredEvidenceInspection = { kind: "wasm_artifact", evidence_id: evidenceId };
+  if (entry.tool === "http_request" && activeRun.pendingExploration) {
+    const exploration = activeRun.pendingExploration;
+    const responseText = bytes.toString("utf8");
+    const newClue = Boolean(entry.redirect_location_present) || /<(?:a|form|script)\b|(?:\/api\/|application\/json|location\s*[:=])/i.test(responseText);
+    const meaningful = newClue || (entry.status_code >= 300 && entry.status_code < 400) || (entry.status_code >= 401 && entry.status_code !== 404);
+    if (meaningful && activeRun.explorationBudgetUsed > 0 && activeRun.explorationBudgetRemaining < activeRun.explorationBudget) {
+      activeRun.explorationBudgetUsed -= 1;
+      activeRun.explorationBudgetRemaining += 1;
+    }
+    const log = activeRun.explorationLog.at(-1);
+    if (log) { log.outcome = meaningful ? "refunded" : "consumed"; log.meaningful_fact = meaningful; log.evidence_id = evidenceId; }
+    activeRun.pendingExploration = null;
+  }
+  if (entry.tool === "http_request" || entry.tool === "websocket_exchange" || entry.tool === "browser_action")
+    updateHypothesisBoard(entry.reasoning, evidenceId, entry.status_code, entry.outcome, body);
   persistState();
-  return { evidence_id: evidenceId, outcome: entry.outcome, status_code: entry.status_code ?? null, transport_error: entry.transport_error ?? null, response_bytes: bytes.length, preview: entry.preview ?? "", content_type: entry.content_type ?? null, reasoning: entry.reasoning ?? null };
+  return { evidence_id: evidenceId, outcome: entry.outcome, status_code: entry.status_code ?? null, transport_error: entry.transport_error ?? null, response_bytes: bytes.length, preview: entry.preview ?? "", content_type: entry.content_type ?? null, reasoning: entry.reasoning ?? null, hypothesis_board: hypothesisBoardSummary() };
 }
 function cookieHeader(url) { return [...activeRun.cookies.values()].filter((cookie) => cookie.domain === url.hostname && url.pathname.startsWith(cookie.path) && (!cookie.secure || url.protocol === "https:")).map((cookie) => `${cookie.name}=${cookie.value}`).join("; "); }
 function storeCookies(response, url) {
@@ -602,6 +830,10 @@ function contentType(headers) {
   const entries = Object.entries(headers ?? {});
   const match = entries.find(([name]) => name.toLowerCase() === "content-type");
   return match ? match[1].trim().toLowerCase() : null;
+}
+function isXmlContentType(value) {
+  const mime = String(value ?? "").split(";", 1)[0].trim().toLowerCase();
+  return mime === "application/xml" || mime === "text/xml" || /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+\+xml$/.test(mime);
 }
 function isWasmArtifact(entry, body) {
   const normalizedContentType = typeof entry.content_type === "string" ? entry.content_type.split(";", 1)[0].trim().toLowerCase() : "";
@@ -732,18 +964,21 @@ function requestParams(params) {
     if (typeof key !== "string" || typeof value !== "string" || key.length > 128 || value.length > 4096 || headerBytes > MAX_HEADER_BYTES || !HEADER_NAME.test(key) || /[\r\n\x00]/.test(value) || headerNames.has(name) || FORBIDDEN_HEADERS.has(name) || !allowed) throw new Error("Unsafe request header");
     headerNames.add(name);
   }
-  if (params.method === "GET" && (params.form || params.json || params.evidence_form_fields)) throw new Error("GET requests cannot have a body");
+  if (params.method === "GET" && (params.form || params.json || params.raw_xml || params.evidence_form_fields)) throw new Error("GET requests cannot have a body");
   if (params.multipart !== undefined && (params.method !== "POST" || params.action_kind !== "submit")) throw new Error("Multipart requires method POST and action_kind submit.");
   if (params.multipart !== undefined && (params.form !== undefined || params.json !== undefined || params.evidence_form_fields !== undefined)) throw new Error("Multipart is mutually exclusive with form, json, and evidence_form_fields");
   if (params.multipart !== undefined && Object.entries(params.headers ?? {}).some(([key]) => key.toLowerCase() === "content-type")) throw new Error("Multipart Content-Type is managed automatically");
   if (params.form && params.json) throw new Error("Form and JSON bodies are mutually exclusive");
+  if (params.raw_xml !== undefined && (params.method !== "POST" || params.form !== undefined || params.json !== undefined || params.multipart !== undefined || params.evidence_form_fields !== undefined)) throw new Error("raw_xml requires a POST request with no other body");
+  if (params.raw_xml !== undefined && (typeof params.raw_xml !== "string" || Buffer.byteLength(params.raw_xml, "utf8") > MAX_RAW_XML)) throw new Error("Invalid raw XML body");
   const suppliedContentType = contentType(params.headers);
-  if (suppliedContentType && !["application/x-www-form-urlencoded", "application/json"].includes(suppliedContentType)) throw new Error("Unsafe Content-Type value");
-  if (suppliedContentType && !params.form && !params.json) throw new Error("Content-Type requires a form or JSON body");
+  if (params.raw_xml !== undefined && suppliedContentType && !isXmlContentType(suppliedContentType)) throw new Error("Raw XML requires an XML Content-Type");
+  if (suppliedContentType && !params.raw_xml && !["application/x-www-form-urlencoded", "application/json"].includes(suppliedContentType)) throw new Error("Unsafe Content-Type value");
+  if (suppliedContentType && !params.form && !params.json && params.raw_xml === undefined) throw new Error("Content-Type requires a form or JSON body");
   if (params.form && suppliedContentType && suppliedContentType !== "application/x-www-form-urlencoded") throw new Error("Conflicting Content-Type for form body");
   if (params.json && suppliedContentType && suppliedContentType !== "application/json") throw new Error("Conflicting Content-Type for JSON body");
   let body = "";
-  try { body = params.form ? new URLSearchParams(params.form).toString() : params.json ? JSON.stringify(params.json) : ""; } catch { throw new Error("Invalid request body"); }
+  try { body = params.form ? new URLSearchParams(params.form).toString() : params.json ? JSON.stringify(params.json) : params.raw_xml ?? ""; } catch { throw new Error("Invalid request body"); }
   if (Buffer.byteLength(body) > MAX_BODY) throw new Error("Request body limit exceeded");
   const url = new URL(`${activeRun.target_origin}${params.path}`);
   for (const [key, value] of Object.entries(params.query ?? {})) { if (!/^[\w.-]{1,128}$/.test(key) || typeof value !== "string" || value.length > 1024) throw new Error("Invalid query parameter"); url.searchParams.set(key, value); }
@@ -764,6 +999,7 @@ function performHttpsRequest(request, controller) {
     if (request.multipart) { body = request.multipart.rawBody; headers["content-type"] = request.multipart.contentType; }
     else if (request.form) { body = Buffer.from(new URLSearchParams(request.form).toString()); if (!contentType(headers)) headers["content-type"] = "application/x-www-form-urlencoded"; }
     else if (request.json) { body = Buffer.from(JSON.stringify(request.json)); if (!contentType(headers)) headers["content-type"] = "application/json"; }
+    else if (request.raw_xml) { body = Buffer.from(request.raw_xml, "utf8"); if (!contentType(headers)) headers["content-type"] = "application/xml"; }
     if (body && !headers["content-length"] && !headers["Content-Length"]) headers["content-length"] = String(body.length);
     const agent = new HttpsAgent({ rejectUnauthorized: !activeRun.insecure_tls, maxSockets: 1 });
     const client = httpsRequest({ protocol: "https:", hostname: request.url.hostname, port: request.url.port || 443, path: `${request.url.pathname}${request.url.search}`, method: request.method, headers, agent, servername: request.url.hostname }, (response) => {
@@ -785,10 +1021,10 @@ function performHttpsRequest(request, controller) {
 async function performHttpRequest(params) {
   ensureActive(); const request = requestParams(params); const fingerprint = reasoningFingerprint(request); if (activeRun.reasoning.tested_experiments.includes(fingerprint)) throw new Error("Equivalent reasoning experiment was already attempted"); const decision = requestDecision(request); if (!decision.allow) throw new Error(decision.reason); consumeAction(); if (decision.hypothesisPath) { activeRun.hypothesisRoutePaths.add(decision.hypothesisPath); persistState(); } const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), request.timeout); let body = Buffer.alloc(0); let response; let outcome = "completed"; let error = ""; const started = Date.now();
   let transportDetail = "";
-  try { const headers = { ...(request.headers ?? {}) }; const cookies = cookieHeader(request.url); if (cookies) headers.Cookie = cookies; const init = { method: request.method, headers, redirect: "manual", signal: controller.signal }; if (request.url.protocol === "https:") response = await performHttpsRequest({ ...request, headers }, controller); else { if (request.multipart) init.body = request.multipart.body; else if (request.form) { init.body = new URLSearchParams(request.form).toString(); if (!contentType(headers)) headers["content-type"] = "application/x-www-form-urlencoded"; } if (request.json) { init.body = JSON.stringify(request.json); if (!contentType(headers)) headers["content-type"] = "application/json"; } response = await fetch(request.url, init); body = await readBody(response, controller.signal); } storeCookies(response, request.url); if (request.url.protocol === "https:") body = response.body; if (response.status >= 300 && response.status < 400) outcome = "redirect"; else if (response.status >= 400) outcome = "http_error"; } catch (caught) { outcome = controller.signal.aborted ? "timeout" : "error"; error = caught instanceof Error ? caught.message : "request failed"; transportDetail = caught instanceof Error && caught.cause?.code ? String(caught.cause.cause?.code ?? caught.cause.code) : ""; } finally { clearTimeout(timer); }
+  try { const headers = { ...(request.headers ?? {}) }; const cookies = cookieHeader(request.url); if (cookies) headers.Cookie = cookies; const init = { method: request.method, headers, redirect: "manual", signal: controller.signal }; if (request.url.protocol === "https:") response = await performHttpsRequest({ ...request, headers }, controller); else { if (request.multipart) init.body = request.multipart.body; else if (request.form) { init.body = new URLSearchParams(request.form).toString(); if (!contentType(headers)) headers["content-type"] = "application/x-www-form-urlencoded"; } if (request.json) { init.body = JSON.stringify(request.json); if (!contentType(headers)) headers["content-type"] = "application/json"; } if (request.raw_xml) { init.body = request.raw_xml; if (!contentType(headers)) headers["content-type"] = "application/xml"; } response = await fetch(request.url, init); body = await readBody(response, controller.signal); } storeCookies(response, request.url); if (request.url.protocol === "https:") body = response.body; if (response.status >= 300 && response.status < 400) outcome = "redirect"; else if (response.status >= 400) outcome = "http_error"; } catch (caught) { outcome = controller.signal.aborted ? "timeout" : "error"; error = caught instanceof Error ? caught.message : "request failed"; transportDetail = caught instanceof Error && caught.cause?.code ? String(caught.cause.cause?.code ?? caught.cause.code) : ""; } finally { clearTimeout(timer); }
   const transportError = transportErrorCode(response?.status ?? null, outcome, `${error} ${transportDetail}`);
   const reasoning = updateReasoning(request, response?.status ?? null, outcome, `${error} ${transportDetail}`);
-    return writeEvidence({ tool: "http_request", action_kind: request.action_kind, duration_ms: Date.now() - started, outcome, status_code: response?.status ?? null, transport_error: transportError, bytes: body.length, redirect_location_present: Boolean(response?.headers.has("location")), response_headers: headersForEvidence(response?.headers), content_type: response?.headers.get("content-type") ?? null, preview: transportError ? sanitizedTransportPreview(transportError) : sanitize(body.toString("utf8"), 1024), reasoning, request: { method: request.method, path: request.path, query_hash: hash(JSON.stringify(request.query ?? {})), body_hash: hash(request.multipart ? JSON.stringify(request.multipart.metadata) : Buffer.from(request.form ? new URLSearchParams(request.form).toString() : request.json ? JSON.stringify(request.json) : "")), ...(request.evidenceFormFields ? { evidence_form_fields: request.evidenceFormFields } : {}), ...(request.multipart ? { multipart: request.multipart.metadata } : {}) } }, body.length ? body : transportError ? sanitizedTransportPreview(transportError) : error);
+    return writeEvidence({ tool: "http_request", action_kind: request.action_kind, duration_ms: Date.now() - started, outcome, status_code: response?.status ?? null, transport_error: transportError, bytes: body.length, redirect_location_present: Boolean(response?.headers.has("location")), response_headers: headersForEvidence(response?.headers), content_type: response?.headers.get("content-type") ?? null, preview: transportError ? sanitizedTransportPreview(transportError) : sanitize(body.toString("utf8"), 1024), reasoning, request: { method: request.method, path: request.path, query_hash: hash(JSON.stringify(request.query ?? {})), body_hash: hash(request.multipart ? JSON.stringify(request.multipart.metadata) : Buffer.from(request.form ? new URLSearchParams(request.form).toString() : request.json ? JSON.stringify(request.json) : request.raw_xml ?? "")), ...(request.evidenceFormFields ? { evidence_form_fields: request.evidenceFormFields } : {}), ...(request.multipart ? { multipart: request.multipart.metadata } : {}) } }, body.length ? body : transportError ? sanitizedTransportPreview(transportError) : error);
 }
 async function httpRequest(params) {
   ensureFirstInteractiveHttp(params);
@@ -866,6 +1102,7 @@ async function websocketExchange(params) {
   if (activeRun.reasoning.tested_experiments.includes(fingerprint)) throw new Error("Equivalent reasoning experiment was already attempted");
   consumeAction();
   const started = Date.now();
+  let actionResult;
   const received = [];
   let receivedBytes = 0;
   let ws;
@@ -950,8 +1187,47 @@ function evidenceFor(id) {
     const checkpointResult = clearsCheckpoint ? { checkpoint_cleared: checkpoint.kind, next_action_guidance: checkpoint.kind === "wasm_artifact" ? "WASM inspection checkpoint cleared. Use observed exports, sections, strings, or derived evidence for the next evidence-backed decision; do not resume unrelated endpoint guessing." : checkpoint.kind === "post_session_authenticated" ? "Authenticated evidence inspected. Follow an observed authenticated link, form action, redirect, or route clue before another HTTP request." : "Failed login evidence inspected. Derive the next request from observed evidence before another login submission." } : {};
     return { ...common, ...details, ...checkpointResult };
   }
+function derivationBytes(params) {
+  const derivation = params.derivation;
+  if (!derivation || typeof derivation !== "object" || Array.isArray(derivation) || !DERIVATION_OPERATIONS.has(derivation.operation)) throw new Error("Invalid flag derivation");
+  const ids = derivation.source_evidence_ids ?? (derivation.source_evidence_id ? [derivation.source_evidence_id] : []);
+  if (!Array.isArray(ids) || !ids.length || ids.length > 4 || ids.some((id) => typeof id !== "string" || !/^e-\d{3,}$/.test(id))) throw new Error("Invalid flag derivation evidence");
+  const sources = ids.map((id) => evidenceFor(id));
+  if (sources.some(({ publicRecord }) => !["http_request", "derive_binary_evidence"].includes(publicRecord.tool))) throw new Error("Flag derivation source is not eligible");
+  if (derivation.operation === "concat") {
+    const combined = Buffer.concat(sources.map(({ body }) => body));
+    if (combined.length > MAX_DERIVATION_BYTES) throw new Error("Flag derivation output is too large");
+    return combined;
+  }
+  if (ids.length !== 1) throw new Error("This flag derivation operation requires one evidence source");
+  const source = sources[0].body;
+  const offset = derivation.offset ?? 0;
+  const length = derivation.length ?? source.length - offset;
+  if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 1 || offset > source.length || length > source.length - offset || length > MAX_DERIVATION_BYTES) throw new Error("Invalid flag derivation range");
+  const selected = source.subarray(offset, offset + length);
+  if (derivation.operation === "base64_decode") {
+    const encoded = selected.toString("utf8");
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error("Invalid derived base64");
+    return Buffer.from(encoded, "base64");
+  }
+  if (derivation.operation === "url_decode") {
+    try { return Buffer.from(decodeURIComponent(selected.toString("utf8")), "utf8"); } catch { throw new Error("Invalid derived URL encoding"); }
+  }
+  if (derivation.operation === "hex_decode") {
+    const hex = selected.toString("utf8");
+    if (!/^(?:[0-9a-fA-F]{2})+$/.test(hex)) throw new Error("Invalid derived hex");
+    return Buffer.from(hex, "hex");
+  }
+  if (typeof derivation.key_base64 !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(derivation.key_base64)) throw new Error("Invalid derived XOR key");
+  const key = Buffer.from(derivation.key_base64, "base64");
+  if (!key.length || key.length > 64) throw new Error("Invalid derived XOR key");
+  const output = Buffer.alloc(selected.length);
+  for (let index = 0; index < selected.length; index += 1) output[index] = selected[index] ^ key[index % key.length];
+  return output;
+}
 function verifyFlag(params) {
-  ensureActive(); const { body } = evidenceFor(params.evidence_id); const text = body.toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence"); activeRun.status = "solved"; activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; atomicWrite(join(activeRun.paths.private, "verified-flag.txt"), `${match.value}\n`); activeRun.report.last_progress = "Flag verified"; activeRun.report.resume_from = params.evidence_id; writeLiveLine(activeRun.startedAt, "Flag verified"); const result = { status: "solved", run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
+  ensureActive(); const { body } = evidenceFor(params.evidence_id); // Verify against raw private evidence, never a redacted preview.
+  const text = (params.derivation === undefined ? body : derivationBytes(params)).toString("utf8"); const candidateMatches = params.candidate && activeRun.flagPattern.test(params.candidate); const match = candidateMatches && text.includes(params.candidate) ? { value: params.candidate, index: text.indexOf(params.candidate) } : (() => { const found = activeRun.flagPattern.exec(text); return found ? { value: found[0], index: found.index } : null; })(); if (!match) throw new Error("No matching flag in retained evidence or proven derivation"); activeRun.status = "solved"; void closeBrowser(); activeRun.verified = { evidence_id: params.evidence_id, flag_sha256: hash(match.value) }; atomicWrite(join(activeRun.paths.private, "verified-flag.txt"), `${match.value}\n`); activeRun.report.last_progress = "Flag verified"; activeRun.report.resume_from = params.evidence_id; writeLiveLine(activeRun.startedAt, "Flag verified");   const result = { status: "solved", run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, exploration_budget_used: activeRun.explorationBudgetUsed, exploration_budget_remaining: activeRun.explorationBudgetRemaining, hypothesis_board: hypothesisBoardSummary(), retired_hypotheses: (activeRun.retiredHypotheses ?? []).map((h) => ({ id: h.id, family: h.family, branch: h.branch, confidence: Math.round(h.confidence * 100) / 100, summary: h.summary, retired_reason: h.retired_reason })), verified: true, verified_evidence_id: params.evidence_id, flag_sha256: hash(match.value), finalized_at: new Date().toISOString() }; atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState(); clearWatchdog(); return { verified: true, evidence_id: params.evidence_id, flag: match.value, flag_sha256: hash(match.value), match_offset: match.index };
 }
 function cookieReplacementParams(params) {
   const allowed = new Set(["hypothesis_id", "cookie_name", "cookie_value", "path"]);
@@ -1009,15 +1285,11 @@ function finalizeResult(params) {
   if (activeRun.status !== "active") return { status: activeRun.status, already_finalized: true };
   if (!TERMINAL_STATUSES.has(params.status)) throw new Error("Invalid terminal result status");
   const actionableUntested = (activeRun.reasoning.untested_experiments ?? []).filter((experiment) => !String(experiment).startsWith(UNAVAILABLE_CAPABILITY_MARKER));
-  if (activeRun.status !== "timeout" && activeRun.actionCount < activeRun.action_budget && activeRun.reasoning.current_hypothesis && activeRun.reasoning.supporting_evidence.length && actionableUntested.length) throw new Error("Cannot finalize while an evidence-backed untested experiment remains");
+  const boardRank1 = (activeRun.hypothesisBoard ?? []).find((h) => !h.retired && h.rank === 1);
+  if (activeRun.status !== "timeout" && activeRun.actionCount < activeRun.action_budget && ((activeRun.reasoning.current_hypothesis && activeRun.reasoning.supporting_evidence.length && actionableUntested.length) || (boardRank1 && boardRank1.next_experiment && boardRank1.confidence >= HYPOTHESIS_MIN_CONFIDENCE))) throw new Error("Cannot finalize while an evidence-backed untested experiment remains");
   const reasonCodes = new Set(["no_progress", "deadline_reached", "action_budget_reached", "runner_failure"]);
   if (params.reason_code !== undefined && !reasonCodes.has(params.reason_code)) throw new Error("Invalid terminal reason code");
-  activeRun.status = params.status;
-  activeRun.report.last_progress = `Terminal failure: ${params.status}`;
-  writeLiveLine(activeRun.startedAt, `Important milestone: terminal failure (${params.status})`);
-  const result = { status: params.status, run_id: activeRun.run_id, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, finalized_at: new Date().toISOString() };
-  if (params.reason_code) result.reason_code = params.reason_code;
-  atomicWrite(activeRun.paths.result, `${JSON.stringify(result, null, 2)}\n`); persistState();
+  const result = terminalResult(params.status, params.reason_code ?? "runner_failure");
   return { status: params.status, action_count: activeRun.actionCount, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash };
 }
 
@@ -1106,6 +1378,131 @@ function searchSource(params) {
 }
 
 const executables = { file: ["/usr/bin/file", "/bin/file"], strings: ["/usr/bin/strings", "/bin/strings"], readelf: ["/usr/bin/readelf", "/opt/homebrew/bin/readelf"], objdump: ["/usr/bin/objdump", "/opt/homebrew/bin/objdump"], nm: ["/usr/bin/nm", "/usr/bin/nm-classic", "/opt/homebrew/bin/nm"], sha256: ["/usr/bin/shasum", "/bin/shasum"] };
+async function closeBrowser() {
+  const context = browserContext;
+  const browser = browserInstance;
+  browserContext = null;
+  browserPage = null;
+  browserOrigin = null;
+  browserInstance = null;
+  try { await context?.close(); } catch {}
+  try { await browser?.close(); } catch {}
+}
+function browserSelector(value) {
+  if (typeof value !== "string" || !value.trim() || value.length > 512 || /[\u0000\r\n]/.test(value)) throw new Error("Invalid browser CSS selector");
+  return value;
+}
+function browserValue(value, label, limit = 16 * 1024) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (typeof text !== "string" || text.length > limit || /\u0000/.test(text)) throw new Error(`Invalid browser ${label}`);
+  return text;
+}
+function browserEvalAllowed(source) {
+  if (typeof source !== "string" || source.length < 1 || source.length > 4096) throw new Error("Invalid browser eval source");
+  if (/(?:fetch|XMLHttpRequest|WebSocket|window\.open|document\.cookie|location\s*=|importScripts|navigator\.sendBeacon)\s*[(=]/i.test(source)) throw new Error("Browser eval uses a blocked capability");
+  for (const item of activeRun.evidenceRecords.values()) {
+    if (readFileSync(item.privatePath, "utf8").includes(source)) return source;
+  }
+  throw new Error("Browser eval must exactly match script retained in current-run evidence");
+}
+async function launchBrowser() {
+  if (browserPage) return browserPage;
+  try {
+    const { chromium } = await import("playwright");
+    browserInstance = await chromium.launch({ headless: true });
+    browserContext = await browserInstance.newContext({ acceptDownloads: false });
+    browserOrigin = activeRun.target_origin;
+    await browserContext.route("**/*", async (route) => {
+      try { if (new URL(route.request().url()).origin !== browserOrigin) return route.abort(); } catch { return route.abort(); }
+      return route.continue();
+    });
+    browserContext.on("download", (download) => { void download.cancel().catch(() => {}); });
+    browserPage = await browserContext.newPage();
+    browserContext.on("page", (page) => { if (page !== browserPage) void page.close().catch(() => {}); });
+    browserPage.on("popup", (page) => { void page.close().catch(() => {}); });
+    return browserPage;
+  } catch (error) {
+    await closeBrowser();
+    throw new Error(`Browser capability unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+function browserCookies(cookies) {
+  return cookies.map((cookie) => ({ name: cookie.name, domain: cookie.domain, path: cookie.path, secure: cookie.secure, http_only: cookie.httpOnly, same_site: cookie.sameSite ?? null }));
+}
+async function browserSnapshot(page, timeout) {
+  const currentUrl = page.url();
+  const resolved = resolveSameOriginUrl(currentUrl, activeRun.target_origin);
+  if (!resolved) throw new Error("Browser page escaped the bound origin");
+  const content = (await page.content()).slice(0, MAX_BODY);
+  const dom = await page.evaluate(() => {
+    const controls = (form) => [...form.querySelectorAll("input,textarea,select,button")].slice(0, 32).map((element) => ({ tag: element.tagName.toLowerCase(), name: element.getAttribute("name") ?? "", type: element.getAttribute("type") ?? element.tagName.toLowerCase(), value: /pass|secret|token|csrf|session|cookie|auth/i.test(`${element.getAttribute("name") ?? ""} ${element.getAttribute("type") ?? ""}`) ? "[REDACTED_SECRET]" : String(element.value ?? "").slice(0, 256) }));
+    return {
+      forms: [...document.forms].slice(0, 32).map((form) => ({ action: form.action, method: (form.method || "get").toUpperCase(), controls: controls(form) })),
+      links: [...document.links].slice(0, 32).map((link) => link.href),
+    };
+  });
+  const parsed = inspectHtml(content, currentUrl);
+  const cookies = browserContext ? browserCookies(await browserContext.cookies(activeRun.target_origin)) : [];
+  return { success: true, current_url: currentUrl, page_title: sanitize(await page.title(), 256), visible_text: sanitize(await page.locator("body").innerText({ timeout }), MAX_INSPECT), forms: dom.forms.map((form) => ({ ...form, action: displayResolvedUrl(form.action, currentUrl) })), links: dom.links.map((link) => displayResolvedUrl(link, currentUrl)), scripts: parsed.scripts, cookies };
+}
+async function browserAction(params) {
+  ensureActive();
+  const action = params.action;
+  const allowed = new Set(["goto", "click", "type", "submit", "screenshot", "eval", "get_storage", "set_storage", "wait", "close"]);
+  if (!allowed.has(action)) throw new Error("Invalid browser action");
+  const timeout = params.timeout_ms ?? 5000;
+  if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid browser timeout");
+  if (["get_storage", "set_storage"].includes(action) && !["localStorage", "sessionStorage"].includes(params.storage_type)) throw new Error("Invalid browser storage type");
+  consumeAction();
+  const started = Date.now();
+  try {
+    if (action === "close") {
+      await closeBrowser();
+      const result = { success: true, current_url: null, page_title: "", visible_text: "", forms: [], links: [], scripts: [], cookies: [] };
+      return { ...writeEvidence({ tool: "browser_action", action, outcome: "completed", duration_ms: Date.now() - started, preview: JSON.stringify(result) }, JSON.stringify(result)), ...result };
+    }
+    const page = await launchBrowser();
+    if (action === "goto") {
+      const url = resolveSameOriginUrl(browserValue(params.value ?? "/", "navigation"), activeRun.target_origin);
+      if (!url) throw new Error("Browser navigation must remain on the bound origin");
+      await page.goto(url.href, { waitUntil: "domcontentloaded", timeout });
+    } else if (action === "click") await page.locator(browserSelector(params.selector)).click({ timeout });
+    else if (action === "type") await page.locator(browserSelector(params.selector)).fill(browserValue(params.value, "input"), { timeout });
+    else if (action === "submit") { await page.locator(browserSelector(params.selector)).evaluate((element) => element instanceof HTMLFormElement ? element.requestSubmit() : element.click()); await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => {}); }
+    else if (action === "screenshot") {}
+    else if (action === "wait") {
+      if (params.wait_for === "networkidle") await page.waitForLoadState("networkidle", { timeout });
+      else if (params.wait_for) await page.locator(browserSelector(params.wait_for)).waitFor({ state: "visible", timeout });
+      else await page.waitForTimeout(Math.min(timeout, 10000));
+    } else if (action === "get_storage") {
+      const storage = params.storage_type;
+      const key = params.storage_key;
+      if (typeof key !== "string" || !key || key.length > 256) throw new Error("Invalid browser storage key");
+      actionResult = await page.evaluate(({ storage, key }) => window[storage][key], { storage, key });
+    } else if (action === "set_storage") {
+      if (typeof params.storage_key !== "string" || !params.storage_key || params.storage_key.length > 256) throw new Error("Invalid browser storage key");
+      const value = browserValue(params.storage_value ?? params.value, "storage value");
+      await page.evaluate(({ storage, key, value }) => window[storage].setItem(key, value), { storage: params.storage_type, key: params.storage_key, value });
+    } else if (action === "eval") {
+      const source = browserEvalAllowed(browserValue(params.value, "eval source", 4096));
+      actionResult = await page.evaluate((script) => (0, eval)(script), source);
+    }
+    if (params.wait_for && action !== "wait") {
+      if (params.wait_for === "networkidle") await page.waitForLoadState("networkidle", { timeout });
+      else await page.locator(browserSelector(params.wait_for)).waitFor({ state: "visible", timeout });
+    }
+    const result = await browserSnapshot(page, timeout);
+    if (action === "screenshot") result.screenshot_base64 = (await page.screenshot({ type: "png" })).toString("base64");
+    if (action === "get_storage") result.eval_result = sanitize(JSON.stringify(actionResult ?? null), MAX_INSPECT);
+    if (action === "eval") result.eval_result = sanitize(JSON.stringify(actionResult ?? null), MAX_INSPECT);
+    const privateResult = { ...result, eval_result: action === "eval" || action === "get_storage" ? actionResult : result.eval_result };
+    return { ...writeEvidence({ tool: "browser_action", action, outcome: "completed", duration_ms: Date.now() - started, current_url: result.current_url, preview: sanitize(JSON.stringify(result), 2048) }, JSON.stringify(privateResult)), ...result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const result = { success: false, current_url: browserPage?.url() || null, page_title: "", visible_text: "", forms: [], links: [], scripts: [], cookies: [], error: sanitize(message, 512) };
+    return { ...writeEvidence({ tool: "browser_action", action, outcome: "error", duration_ms: Date.now() - started, preview: JSON.stringify(result) }, message), ...result };
+  }
+}
 function localCommand(params) {
   ensureActive(); if (!activeRun.source_root) throw new Error("Source analysis requires an optional source directory"); if (!Object.hasOwn(executables, params.profile)) throw new Error("Invalid source analysis profile"); const timeout = Number(params.timeout_ms); if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid timeout"); if (!Array.isArray(params.paths) || params.paths.length < 1 || params.paths.length > 8) throw new Error("Invalid source analysis paths"); const sourceRoot = realpathSync(activeRun.source_root); const paths = params.paths.map((path) => { if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) throw new Error("Unsafe source path"); const target = resolve(sourceRoot, path); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("Source path escapes supplied directory"); rejectSymlinks(sourceRoot, target); return target; }); const executable = executables[params.profile].find((path) => existsSync(path)); if (!executable) throw new Error("Source analysis executable unavailable"); const args = Array.isArray(params.args) ? params.args : []; if (args.length > 16 || args.some((arg) => typeof arg !== "string" || arg.length > 256)) throw new Error("Invalid source analysis arguments"); const commandArgs = params.profile === "sha256" ? ["-a", "256", ...paths] : [...args, ...paths]; consumeAction(); return new Promise((resolveResult) => { const child = spawn(executable, commandArgs, { cwd: sourceRoot, shell: false, env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" } }); const out = []; let size = 0; const collect = (chunk) => { size += chunk.length; if (size <= MAX_BODY) out.push(chunk); else child.kill("SIGTERM"); }; child.stdout.on("data", collect); child.stderr.on("data", collect); const timer = setTimeout(() => child.kill("SIGTERM"), timeout); child.on("close", (code, signal) => { clearTimeout(timer); const body = Buffer.concat(out); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: size > MAX_BODY ? "output_limit" : signal ? "timeout" : code === 0 ? "completed" : "error", exit_code: code, preview: sanitize(body.toString("utf8")) }, body)); }); child.on("error", (error) => { clearTimeout(timer); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: "error", preview: sanitize(error.message) }, error.message)); }); }); }
 
@@ -1128,9 +1525,10 @@ function capabilityAwareExecute(toolName, execute) {
   };
 }
 function textResult(value) { if (activeRun) { activeRun.toolCallCount += 1; persistState(); } return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }; }
-  const httpRequestTool = defineTool({ name: "http_request", label: "HTTP Request", description: "Perform one bounded same-origin Web request and retain its evidence with required reasoning. For an observed multipart form with no hidden inputs, omit multipart.evidence_form_fields; source evidence plus the observed file field is sufficient. source_evidence_id is the page containing the observed form; submit multipart POST to that form's observed action path, not necessarily the page path.", parameters: Type.Object({ method: Type.Union([Type.Literal("GET"), Type.Literal("POST")]), path: Type.String(), query: Type.Optional(Type.Record(Type.String(), Type.String())), form: Type.Optional(Type.Record(Type.String(), Type.String())), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())), json: Type.Optional(Type.Record(Type.String(), Type.Unknown())), multipart: Type.Optional(Type.Object({ source_evidence_id: Type.String(), file: Type.Object({ field_name: Type.String(), filename: Type.String(), content_type: Type.String(), content_base64: Type.String() }), fields: Type.Optional(Type.Record(Type.String(), Type.String())), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())) })), headers: Type.Optional(Type.Record(Type.String(), Type.String())), reasoning: Type.Object({ evidence_summary: Type.Array(Type.String()), leading_hypothesis: Type.String(), supporting_evidence: Type.Array(Type.String()), experiment: Type.String(), expected_observation: Type.String(), confidence: Type.Number(), untested_experiments: Type.Optional(Type.Array(Type.String())) }), action_kind: Type.Union([Type.Literal("recon"), Type.Literal("login"), Type.Literal("authenticated_request"), Type.Literal("submit"), Type.Literal("trigger")]), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await httpRequest(params)); } });
-  const websocketExchangeTool = defineTool({ name: "websocket_exchange", label: "WebSocket Exchange", description: "Open one bounded same-origin WebSocket supported by retained HTTP evidence, send ordered text messages, retain sanitized exchange evidence, and close.", parameters: Type.Object({ path: Type.String(), messages: Type.Array(Type.String()), subprotocols: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Optional(Type.Number()), max_messages: Type.Optional(Type.Number()), close_after_receive: Type.Optional(Type.Boolean()), reasoning: Type.Object({ evidence_summary: Type.Array(Type.String()), leading_hypothesis: Type.String(), supporting_evidence: Type.Array(Type.String()), experiment: Type.String(), expected_observation: Type.String(), confidence: Type.Number(), untested_experiments: Type.Optional(Type.Array(Type.String())) }) }), async execute(_id, params) { return textResult(await websocketExchange(params)); } });
- const startCompetitionRunTool = defineTool({ name: "start_competition_run", label: "Start Competition Run", description: "Initialize a private exact-origin competition run from the exact pasted challenge message.", parameters: Type.Object({ challenge_text: Type.String(), time_budget_minutes: Type.Optional(Type.Number()), action_budget: Type.Optional(Type.Number()), flag_regex: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(await startCompetitionRun(params)); } });
+  const browserActionTool = defineTool({ name: "browser_action", label: "Browser Action", description: "Use one persistent, exact-origin browser context for bounded DOM interaction, storage, screenshots, and evidence-bound script evaluation. Popups and downloads are blocked.", parameters: Type.Object({ action: Type.Union([Type.Literal("goto"), Type.Literal("click"), Type.Literal("type"), Type.Literal("submit"), Type.Literal("screenshot"), Type.Literal("eval"), Type.Literal("get_storage"), Type.Literal("set_storage"), Type.Literal("wait"), Type.Literal("close")]), selector: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()), storage_type: Type.Optional(Type.Union([Type.Literal("localStorage"), Type.Literal("sessionStorage")])), storage_key: Type.Optional(Type.String()), storage_value: Type.Optional(Type.Unknown()), timeout_ms: Type.Optional(Type.Number()), wait_for: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(await browserAction(params)); } });
+  const httpRequestTool = defineTool({ name: "http_request", label: "HTTP Request", description: "Perform one bounded same-origin Web request and retain its evidence with required reasoning. Supports bounded raw_xml POST bodies with an XML Content-Type. For an observed multipart form with no hidden inputs, omit multipart.evidence_form_fields; source evidence plus the observed file field is sufficient. source_evidence_id is the page containing the observed form; submit multipart POST to that form's observed action path, not necessarily the page path.", parameters: Type.Object({ method: Type.Union([Type.Literal("GET"), Type.Literal("POST")]), path: Type.String(), query: Type.Optional(Type.Record(Type.String(), Type.String())), form: Type.Optional(Type.Record(Type.String(), Type.String())), raw_xml: Type.Optional(Type.String()), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())), json: Type.Optional(Type.Record(Type.String(), Type.Unknown())), multipart: Type.Optional(Type.Object({ source_evidence_id: Type.String(), file: Type.Object({ field_name: Type.String(), filename: Type.String(), content_type: Type.String(), content_base64: Type.String() }), fields: Type.Optional(Type.Record(Type.String(), Type.String())), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())) })), headers: Type.Optional(Type.Record(Type.String(), Type.String())), reasoning: Type.Object({ evidence_summary: Type.Array(Type.String()), leading_hypothesis: Type.String(), supporting_evidence: Type.Array(Type.String()), experiment: Type.String(), expected_observation: Type.String(), confidence: Type.Number(), untested_experiments: Type.Optional(Type.Array(Type.String())), exploration_score: Type.Optional(Type.Number()), exploration_justification: Type.Optional(Type.String()), route_family: Type.Optional(Type.String()), next_experiment: Type.Optional(Type.String()) }), action_kind: Type.Union([Type.Literal("recon"), Type.Literal("login"), Type.Literal("authenticated_request"), Type.Literal("submit"), Type.Literal("trigger")]), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await httpRequest(params)); } });
+   const websocketExchangeTool = defineTool({ name: "websocket_exchange", label: "WebSocket Exchange", description: "Open one bounded same-origin WebSocket supported by retained HTTP evidence, send ordered text messages, retain sanitized exchange evidence, and close.", parameters: Type.Object({ path: Type.String(), messages: Type.Array(Type.String()), subprotocols: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Optional(Type.Number()), max_messages: Type.Optional(Type.Number()), close_after_receive: Type.Optional(Type.Boolean()), reasoning: Type.Object({ evidence_summary: Type.Array(Type.String()), leading_hypothesis: Type.String(), supporting_evidence: Type.Array(Type.String()), experiment: Type.String(), expected_observation: Type.String(), confidence: Type.Number(), untested_experiments: Type.Optional(Type.Array(Type.String())), exploration_score: Type.Optional(Type.Number()), exploration_justification: Type.Optional(Type.String()), route_family: Type.Optional(Type.String()), next_experiment: Type.Optional(Type.String()) }) }), async execute(_id, params) { return textResult(await websocketExchange(params)); } });
+  const startCompetitionRunTool = defineTool({ name: "start_competition_run", label: "Start Competition Run", description: "Initialize or inspect the private exact-origin competition run from the exact pasted challenge message. A different target origin starts a new isolated run.", parameters: Type.Object({ challenge_text: Type.String(), target_url: Type.Optional(Type.String()), time_budget_minutes: Type.Optional(Type.Number()), action_budget: Type.Optional(Type.Number()), flag_regex: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(await startCompetitionRun(params)); } });
   const inspectEvidenceTool = defineTool({ name: "inspect_evidence", label: "Inspect Evidence", description: "Inspect bounded structured details from retained evidence in this run.", parameters: Type.Object({ evidence_id: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), view: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("hex"), Type.Literal("strings"), Type.Literal("wasm_summary")])) }), async execute(_id, params) { return textResult(inspectEvidence(params)); } });
 const listSourceTool = defineTool({ name: "list_source", label: "List Source", description: "List one bounded supplied-source directory.", parameters: Type.Object({ path: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(listSource(params)); } });
  const readSourceTool = defineTool({ name: "read_source", label: "Read Source", description: "Read one bounded range from a supplied source file.", parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(readSource(params)); } });
@@ -1139,7 +1537,7 @@ const listSourceTool = defineTool({ name: "list_source", label: "List Source", d
   const deriveBinaryEvidenceTool = defineTool({ name: "derive_binary_evidence", label: "Derive Binary Evidence", description: "Derive bounded private evidence from retained bytes using one fixed XOR transform.", parameters: Type.Object({ source_evidence_id: Type.String(), operation: Type.Literal("xor_repeat"), offset: Type.Number(), length: Type.Number(), key_base64: Type.String() }), async execute(_id, params) { return textResult(deriveBinaryEvidence(params)); } });
 const replaceSessionCookieTool = defineTool({ name: "replace_session_cookie", label: "Replace Session Cookie", description: "Replace one named cookie for the exact active target origin and retain redacted evidence.", parameters: Type.Object({ hypothesis_id: Type.String(), cookie_name: Type.String(), cookie_value: Type.String(), path: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(replaceSessionCookie(params)); } });
 const adoptSessionCookieTool = defineTool({ name: "adopt_session_cookie", label: "Adopt Session Cookie", description: "Adopt a named account session from current-run GET /sessions evidence without returning its value.", parameters: Type.Object({ evidence_id: Type.String(), cookie_name: Type.String(), account_key: Type.String() }), async execute(_id, params) { return textResult(adoptSessionCookie(params)); } });
-const verifyFlagTool = defineTool({ name: "verify_flag", label: "Verify Flag", description: "Verify a candidate only against retained evidence and persist the solved result.", parameters: Type.Object({ evidence_id: Type.String(), candidate: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(verifyFlag(params)); } });
+ const verifyFlagTool = defineTool({ name: "verify_flag", label: "Verify Flag", description: "Verify a literal or bounded, provenance-backed derived flag against retained evidence and persist the solved result.", parameters: Type.Object({ evidence_id: Type.String(), candidate: Type.Optional(Type.String()), derivation: Type.Optional(Type.Object({ source_evidence_id: Type.Optional(Type.String()), source_evidence_ids: Type.Optional(Type.Array(Type.String())), operation: Type.Union([Type.Literal("base64_decode"), Type.Literal("url_decode"), Type.Literal("hex_decode"), Type.Literal("xor_repeat"), Type.Literal("concat")]), offset: Type.Optional(Type.Number()), length: Type.Optional(Type.Number()), key_base64: Type.Optional(Type.String()) })) }), async execute(_id, params) { return textResult(verifyFlag(params)); } });
 const finalizeResultTool = defineTool({ name: "finalize_result", label: "Finalize Result", description: "Persist a safe terminal non-solved result when the direct Web solve cannot continue.", parameters: Type.Object({ status: Type.Union([Type.Literal("not_solved"), Type.Literal("timeout"), Type.Literal("action_budget_exhausted"), Type.Literal("infrastructure_failure")]), reason_code: Type.Optional(Type.Union([Type.Literal("no_progress"), Type.Literal("deadline_reached"), Type.Literal("action_budget_reached"), Type.Literal("runner_failure")])) }), async execute(_id, params) { return textResult(finalizeResult(params)); } });
 const localCommandTool = defineTool({ name: "run_local_command", label: "Analyze Source", description: "Run one bounded read-only analysis profile against supplied source.", parameters: Type.Object({ profile: Type.String(), paths: Type.Array(Type.String()), args: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await localCommand(params)); } });
  const originalLocalCommandExecute = localCommandTool.execute;
@@ -1147,7 +1545,7 @@ const localCommandTool = defineTool({ name: "run_local_command", label: "Analyze
    activeRun.pendingAnalysisFingerprint = analysisFingerprint("run_local_command", { profile: params.profile, paths: params.paths, args: params.args ?? [] });
    try { return await originalLocalCommandExecute(id, params); } finally { if (activeRun) activeRun.pendingAnalysisFingerprint = null; }
  };
-     const competitionTools = [httpRequestTool, websocketExchangeTool, startCompetitionRunTool, inspectEvidenceTool, listSourceTool, readSourceTool, searchSourceTool, computeDigestTool, deriveBinaryEvidenceTool, localCommandTool, replaceSessionCookieTool, adoptSessionCookieTool, verifyFlagTool, finalizeResultTool];
+      const competitionTools = [httpRequestTool, websocketExchangeTool, browserActionTool, startCompetitionRunTool, inspectEvidenceTool, listSourceTool, readSourceTool, searchSourceTool, computeDigestTool, deriveBinaryEvidenceTool, localCommandTool, replaceSessionCookieTool, adoptSessionCookieTool, verifyFlagTool, finalizeResultTool];
 for (const tool of competitionTools) {
   let execute = tool.execute;
   if (["list_source", "read_source", "search_source", "run_local_command"].includes(tool.name)) execute = capabilityAwareExecute(tool.name, execute);
@@ -1169,7 +1567,7 @@ export default function (pi) {
     if (!target) return;
     try { ensureRuntimeCurrent(); } catch (error) { extensionApi?.setActiveTools([]); process.stderr.write(`${error.message}\n`); return; }
     retireExpiredRun();
-    if (activeRun?.status === "active") return;
+    if (activeRun?.status === "active" && activeRun.target_origin === target.origin) return;
     extensionApi?.setActiveTools([]);
     try { await startCompetitionRun({ challenge_text: text }, text); } catch (error) { process.stderr.write(`CTF-C interactive initialization failed: ${error.message}\n`); }
   });

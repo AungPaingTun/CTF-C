@@ -8,6 +8,8 @@ import { startH3Fixture } from "../tests/fixtures/h3-csrf-dynamic.mjs";
 import { startH4Fixture } from "../tests/fixtures/h4-api-session.mjs";
 import { startH5Fixture } from "../tests/fixtures/h5-recovery-auth.mjs";
 import { startP10Fixture } from "../tests/fixtures/p10-websocket.mjs";
+import { startDerivedFlagFixture } from "../tests/fixtures/derived-flag.mjs";
+import { startJsLoginFixture } from "../tests/fixtures/js-login-form.mjs";
 
 const projectRoot = resolve(new URL("..", import.meta.url).pathname);
 export const launcherPath = join(projectRoot, "scripts", "run_competition.sh");
@@ -66,6 +68,10 @@ export function summarizeRun({ record, state, result, startedAt, finishedAt, fix
     provider: "unknown",
     failure_class: failureClass,
     failure_detail: safeDetail(status, result?.reason_code),
+    exploration_budget_used: Number.isSafeInteger(state?.exploration_budget_used) ? state.exploration_budget_used : 0,
+    exploration_budget_remaining: Number.isSafeInteger(state?.exploration_budget_used) && Number.isSafeInteger(state?.exploration_budget) ? Math.max(0, state.exploration_budget - state.exploration_budget_used) : 5,
+    hypothesis_board: Array.isArray(state?.hypothesis_board) ? state.hypothesis_board.filter((h) => !h.retired).map((h) => ({ id: h.id, rank: h.rank, family: h.family, branch: h.branch, confidence: Math.round((h.confidence ?? 0) * 100) / 100, summary: h.summary, next_experiment: h.next_experiment })) : [],
+    retired_hypotheses: Array.isArray(state?.retired_hypotheses) ? state.retired_hypotheses.map((h) => ({ id: h.id, family: h.family, branch: h.branch, confidence: Math.round((h.confidence ?? 0) * 100) / 100, summary: h.summary, retired_reason: h.retired_reason })) : [],
   };
 }
 
@@ -75,17 +81,18 @@ function findRecord(runtimeRoot) {
   return join(runtimeRoot, entries[0], "run-record.json");
 }
 
-function invokeLauncher(args, env) {
+function invokeLauncher(args, env, timeoutMs) {
   return new Promise((resolveResult) => {
     const child = spawn(launcherPath, args, { cwd: projectRoot, env, stdio: ["ignore", "ignore", "ignore"] });
+    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
     child.on("error", () => resolveResult(127));
-    child.on("close", (code) => resolveResult(code ?? 127));
+    child.on("close", (code) => { clearTimeout(timer); resolveResult(code ?? 127); });
   });
 }
 
 export async function runReplay({ fixture: fixtureName = "h1-basic-http", timeBudget = "15", actionBudget = "20", piProvider = "", piModel = "", piThinking = "", outputRoot = defaultOutputRoot, env = process.env } = {}) {
   mkdirSync(outputRoot, { recursive: true, mode: 0o700 });
-  const fixtureStart = fixtureName === "h1-basic-http" ? startH1Fixture : fixtureName === "h2-stateful-auth" ? startH2Fixture : fixtureName === "h3-csrf-dynamic" ? startH3Fixture : fixtureName === "h4-api-session" ? startH4Fixture : fixtureName === "h5-recovery-auth" ? startH5Fixture : fixtureName === "p10-websocket" ? startP10Fixture : null;
+  const fixtureStart = fixtureName === "h1-basic-http" ? startH1Fixture : fixtureName === "h2-stateful-auth" ? startH2Fixture : fixtureName === "h3-csrf-dynamic" ? startH3Fixture : fixtureName === "h4-api-session" ? startH4Fixture : fixtureName === "h5-recovery-auth" ? startH5Fixture : fixtureName === "p10-websocket" ? startP10Fixture : fixtureName === "derived-flag" ? startDerivedFlagFixture : fixtureName === "interactive-starter" ? startH1Fixture : fixtureName === "js-login-form" ? startJsLoginFixture : null;
   if (!fixtureStart) throw new Error(`Unsupported fixture: ${fixtureName}`);
   const fixture = await fixtureStart();
   const runtimeRoot = join(runtimeBase, `replay-${randomUUID()}`);
@@ -93,16 +100,24 @@ export async function runReplay({ fixture: fixtureName = "h1-basic-http", timeBu
   const startedAt = Date.now();
   let record;
   try {
+    const replayDescription = fixtureName === "derived-flag"
+      ? "This is a derived-flag challenge. Follow the observed redirects to the final response, retain its encoded value, and use verify_flag with the provenance-backed base64_decode derivation. Do not guess or copy a decoded flag."
+        : fixtureName === "interactive-starter"
+          ? "This is the interactive starter flow. Begin with the required root request, follow the observed route, and verify the flag from retained evidence."
+          : fixtureName === "js-login-form"
+            ? "This challenge requires browser_action. Use the persistent browser context to goto the root, wait for the JavaScript-rendered login form, type the observed credentials from retained page script evidence, submit it, and verify the success response."
+          : null;
     await invokeLauncher([
       "--target", fixture.origin,
       "--approve",
       "--description", `${fixtureName === "h2-stateful-auth" ? "This is a stateful authentication challenge. Begin with the required root HTTP request. Use observed forms and routes to register a new account, log in with that same account, preserve the automatically issued cookie, follow the observed redirect/dashboard workflow, and verify the flag only from authenticated retained evidence. Do not use session replacement or session adoption tools unless evidence proves they are required. " : fixtureName === "h3-csrf-dynamic" ? "This is a session-bound CSRF authentication challenge. Begin with the required root request. Use observed forms and routes. Registration and login require dynamically generated hidden values that are bound to the current session. Do not guess, hard-code, or expose hidden values. When an observed form requires a session-bound hidden value, do not guess or place the raw value in form. Use evidence_form_fields to map the hidden field name to the evidence ID containing that observed form. The tool will inject the value privately. Continue to use ordinary form fields for username and password. Verify a flag only from authenticated retained evidence. " : fixtureName === "h4-api-session" ? "This is a stateful JSON API authentication challenge. Begin with the required root request. Use only observed routes. Registration and login require JSON request bodies, not form data. Preserve the automatically issued session cookie, follow the observed redirect, inspect the authenticated API state, and verify the flag only from retained authenticated evidence. Do not use session replacement or adoption tools. " : fixtureName === "h5-recovery-auth" ? "This is a recovery authentication challenge. Begin with the required root request. If a login attempt fails, inspect that exact response before another HTTP request, then follow only the observed pivot route. Use observed forms, preserve the automatically issued session cookie after authentication, inspect authenticated evidence, and verify the flag only from the observed authenticated route. " : ""}Challenge target at ${fixture.origin}. Follow observed routes and verify the flag from retained evidence.`,
-      "--time-budget", String(timeBudget),
+       ...(replayDescription ? ["--description", replayDescription] : []),
+       "--time-budget", String(timeBudget),
       "--action-budget", String(actionBudget),
       ...(piProvider ? ["--pi-provider", piProvider] : []),
       ...(piModel ? ["--pi-model", piModel] : []),
       ...(piThinking ? ["--pi-thinking", piThinking] : []),
-    ], { ...env, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot });
+    ], { ...env, CTFC_COMPETITION_RUNTIME_ROOT: runtimeRoot }, Number(timeBudget) * 60000 + 30000);
     const recordPath = findRecord(runtimeRoot);
     record = JSON.parse(readFileSync(recordPath, "utf8"));
     const state = existsSync(record.paths.state) ? JSON.parse(readFileSync(record.paths.state, "utf8")) : null;
@@ -110,9 +125,10 @@ export async function runReplay({ fixture: fixtureName = "h1-basic-http", timeBu
     const summary = summarizeRun({ record, state, result, startedAt: state?.started_at ?? startedAt, finishedAt: Date.now(), fixture: fixtureName });
     const outputPath = join(outputRoot, `${summary.run_id}.json`);
     writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
-    return { summary, outputPath };
+     return { summary, outputPath, record, state, result };
   } catch (error) {
-    const fallback = { run_id: record?.run_id ?? randomUUID(), fixture: fixtureName, started_at: new Date(startedAt).toISOString(), finished_at: new Date().toISOString(), duration_ms: Date.now() - startedAt, terminal_status: "infrastructure_failure", verified: false, verified_flag_sha256: null, actions_total: null, http_actions: null, websocket_actions: null, websocket_evidence_derived: false, tool_actions: null, analysis_actions: null, tool_errors: null, repeated_action_rejections: null, evidence_count: null, model: "unknown", provider: "unknown", failure_class: "infrastructure", failure_detail: "The replay could not safely derive the generated run artifacts." };
+    const detail = String(error?.message ?? "The replay could not safely derive the generated run artifacts.").replace(/[\r\n]+/g, " ").slice(0, 512);
+    const fallback = { run_id: record?.run_id ?? randomUUID(), fixture: fixtureName, started_at: new Date(startedAt).toISOString(), finished_at: new Date().toISOString(), duration_ms: Date.now() - startedAt, terminal_status: "infrastructure_failure", verified: false, verified_flag_sha256: null, actions_total: null, http_actions: null, websocket_actions: null, websocket_evidence_derived: false, tool_actions: null, analysis_actions: null, tool_errors: null, repeated_action_rejections: null, evidence_count: null, model: "unknown", provider: "unknown", failure_class: "infrastructure", failure_detail: detail };
     const outputPath = join(outputRoot, `${fallback.run_id}.json`);
     writeFileSync(outputPath, `${JSON.stringify(fallback, null, 2)}\n`, { mode: 0o600 });
     return { summary: fallback, outputPath, error };
@@ -124,7 +140,7 @@ export async function runReplay({ fixture: fixtureName = "h1-basic-http", timeBu
 async function main() {
   const args = process.argv.slice(2);
   const fixture = option(args, "--fixture", "h1-basic-http");
-  if (!["h1-basic-http", "h2-stateful-auth", "h3-csrf-dynamic", "h4-api-session", "h5-recovery-auth", "p10-websocket"].includes(fixture)) throw new Error("Only h1-basic-http, h2-stateful-auth, h3-csrf-dynamic, h4-api-session, h5-recovery-auth, and p10-websocket are supported");
+  if (!["h1-basic-http", "h2-stateful-auth", "h3-csrf-dynamic", "h4-api-session", "h5-recovery-auth", "p10-websocket", "derived-flag", "interactive-starter", "js-login-form"].includes(fixture)) throw new Error("Unsupported replay fixture");
   const runs = Number(option(args, "--runs", "1"));
   if (!Number.isInteger(runs) || runs < 1) throw new Error("--runs must be a positive integer");
   const outputRoot = option(args, "--output-root", defaultOutputRoot);

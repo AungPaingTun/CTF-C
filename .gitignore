@@ -42,3 +42,6 @@ results/validation/
 # Private competition runtime records
 .ctf-c/competition-runs/
 .ctf-c/replay-output/
+
+# Real-model replay reports may contain verified flags
+reports/

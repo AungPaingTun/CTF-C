@@ -11,7 +11,7 @@ function httpTool() {
 }
 
 async function call(params) {
-  params = { ...params, reasoning: { evidence_summary: ["The fixture returned an observed route clue."], leading_hypothesis: `The route ${params.path} is evidence-backed by the fixture.`, supporting_evidence: ["The active fixture is the current evidence source."], experiment: params.reasoning_experiment ?? `${params.method} ${params.path} decision-harness request`, expected_observation: "The local fixture returns a response.", confidence: 0.5, untested_experiments: [] } };
+  params = { ...params, reasoning: { evidence_summary: ["The fixture returned an observed route clue."], leading_hypothesis: `The route ${params.path} is evidence-backed by the fixture.`, supporting_evidence: ["The active fixture is the current evidence source."], experiment: params.reasoning_experiment ?? `${params.method} ${params.path} decision-harness request`, expected_observation: "The local fixture returns a response.", confidence: 0.5, untested_experiments: [], exploration_score: 0.5, exploration_justification: "The fixture supports a bounded route hypothesis.", route_family: "other" } };
   const result = await httpTool().execute("competition-decision-harness", params);
   return result.details ?? JSON.parse(result.content[0].text);
 }
@@ -173,10 +173,11 @@ export default function (pi) {
       const submitted = await call({ method: "POST", path: "/profile/user/123/update", form: { role: "admin" }, action_kind: "submit", timeout_ms: 2000 });
       assert.equal(submitted.status_code, 200, "form-derived request was rejected");
 
-      const beforeSecondSpray = JSON.parse(readFileSync(record.paths.state, "utf8")).action_count;
-      await assert.rejects(() => call({ method: "GET", path: "/debug", action_kind: "recon", timeout_ms: 2000 }), /Rejected HTTP request/);
-       assert.equal(JSON.parse(readFileSync(record.paths.state, "utf8")).action_count, beforeSecondSpray);
-       assert.ok(!seen.includes("/debug"));
+       const beforeSecondSpray = JSON.parse(readFileSync(record.paths.state, "utf8"));
+       const debugRoute = await call({ method: "GET", path: "/debug", action_kind: "recon", timeout_ms: 2000 });
+       assert.equal(debugRoute.status_code, 404);
+        assert.equal(JSON.parse(readFileSync(record.paths.state, "utf8")).exploration_budget_used, beforeSecondSpray.exploration_budget_used + 1);
+        assert.ok(seen.includes("/debug"));
        const beforeUnobservedPost = JSON.parse(readFileSync(record.paths.state, "utf8"));
        await assert.rejects(() => call({ method: "POST", path: "/unobserved-post", action_kind: "submit", form: { probe: "1" }, timeout_ms: 2000 }), /Strongest current clue/);
        const afterUnobservedPost = JSON.parse(readFileSync(record.paths.state, "utf8"));
@@ -186,14 +187,15 @@ export default function (pi) {
          const hypothesis = await call({ method: "GET", path, action_kind: "recon", timeout_ms: 2000 });
          assert.equal(hypothesis.status_code, 200, `${path} qualifying hypothesis was rejected`);
        }
-       const beforeFourthHypothesis = JSON.parse(readFileSync(record.paths.state, "utf8"));
-       await assert.rejects(() => call({ method: "GET", path: "/hypothesis-four", action_kind: "recon", timeout_ms: 2000 }), /hypothesis route allowance is exhausted/);
-       const afterFourthHypothesis = JSON.parse(readFileSync(record.paths.state, "utf8"));
-       assert.equal(afterFourthHypothesis.action_count, beforeFourthHypothesis.action_count);
-       assert.equal(afterFourthHypothesis.evidence_sequence, beforeFourthHypothesis.evidence_sequence);
+        const beforeFourthHypothesis = JSON.parse(readFileSync(record.paths.state, "utf8"));
+        const fourthHypothesis = await call({ method: "GET", path: "/hypothesis-four", action_kind: "recon", timeout_ms: 2000 });
+        assert.equal(fourthHypothesis.status_code, 404);
+        const afterFourthHypothesis = JSON.parse(readFileSync(record.paths.state, "utf8"));
+        assert.equal(afterFourthHypothesis.exploration_budget_used, beforeFourthHypothesis.exploration_budget_used + 1);
+        assert.equal(afterFourthHypothesis.exploration_budget_remaining, 0);
        await assert.rejects(() => call({ method: "GET", path: "/hypothesis-one", action_kind: "recon", timeout_ms: 2000 }), /repeated hypothesis route/);
         initializeCompetitionRun();
-        await assert.rejects(() => call({ method: "GET", path: "/hypothesis-four-after-resume", action_kind: "recon", timeout_ms: 2000 }), /hypothesis route allowance is exhausted/);
+         await assert.rejects(() => call({ method: "GET", path: "/hypothesis-four-after-resume", action_kind: "recon", timeout_ms: 2000 }), /exploration budget is exhausted/);
         const binaryRecordPath = execFileSync(process.execPath, ["scripts/create_competition_run.mjs", "--target", record.target_origin, "--approve", "--description", "binary evidence regression", "--time-budget", "1", "--action-budget", "20"], { encoding: "utf8", env: { ...process.env, CTFC_PROJECT_ROOT: process.cwd() } }).trim();
         process.env.CTFC_COMPETITION_RUN_RECORD = binaryRecordPath;
          initializeCompetitionRun();

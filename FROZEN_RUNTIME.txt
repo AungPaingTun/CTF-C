@@ -1,0 +1,6 @@
+Pi: 0.82.1
+Node: v24.2.0
+Provider/Model: opencode-go/deepseek-v4-pro
+Extension commit: 0d32b00e9035028d6f7240b75ba73ea0a102f9f3
+Playwright: Version 1.62.1
+Date: 2026-08-05T12:34:49Z

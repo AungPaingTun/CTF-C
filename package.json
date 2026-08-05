@@ -1,0 +1,12 @@
+{
+  "name": "ctf-c",
+  "private": true,
+  "scripts": {
+    "test:real-model": "node scripts/replay_real_model.mjs",
+    "test:browser": "scripts/test_competition_browser.sh",
+    "install:browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

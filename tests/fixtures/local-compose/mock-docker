@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >> "${MOCK_DOCKER_LOG:?}"
+case "$*" in
+  compose*ps*) printf 'NAME IMAGE STATUS PORTS\nlocal-fixture scratch mock\n' ;;
+esac
