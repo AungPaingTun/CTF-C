@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import net from "node:net";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -48,6 +49,11 @@ const HYPOTHESIS_ID = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 const ACCOUNT_KEY = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const TERMINAL_STATUSES = new Set(["not_solved", "timeout", "action_budget_exhausted", "infrastructure_failure"]);
 const DEFAULT_FLAG_REGEX = "picoCTF\\{[^}\\r\\n]{1,256}\\}";
+function detectFlagRegex(challengeText) {
+  if (/flag\{/i.test(challengeText)) return "flag\\{[^}\\r\\n]{1,256}\\}";
+  if (/CTF\{/i.test(challengeText)) return "CTF\\{[^}\\r\\n]{1,256}\\}";
+  return DEFAULT_FLAG_REGEX;
+}
 const MAX_REASONING_TEXT = 512;
 const MAX_REASONING_ITEMS = 5;
 const DEFAULT_EXPLORATION_BUDGET = 5;
@@ -63,7 +69,7 @@ const MAX_DERIVATION_BYTES = 64 * 1024;
 const MAX_DIGEST_TEXT_BYTES = 4096;
 const MAX_DIGEST_PURPOSE = 256;
 const UNAVAILABLE_CAPABILITY_MARKER = "[UNAVAILABLE_CAPABILITY]";
-const COMPETITION_TOOL_NAMES = ["http_request", "websocket_exchange", "browser_action", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result"];
+const COMPETITION_TOOL_NAMES = ["http_request", "websocket_exchange", "browser_action", "start_competition_run", "inspect_evidence", "list_source", "read_source", "search_source", "compute_digest", "derive_binary_evidence", "run_local_command", "replace_session_cookie", "adopt_session_cookie", "verify_flag", "finalize_result", "write_work_file", "run_python", "tcp_connect"];
 let activeRun;
 let extensionApi;
 let lastUserChallenge;
@@ -136,15 +142,49 @@ export function extractCompetitionTarget(text) {
   if (targets.length > 1) throw new Error("Multiple distinct target URLs found");
   return { origin: targets[0].origin, candidate: targets[0].candidate };
 }
+export function extractBinaryTarget(text) {
+  const ncMatch = String(text).match(/\bnc\s+([A-Za-z0-9][-A-Za-z0-9.]*)\s+(\d{1,5})\b/i);
+  if (ncMatch) {
+    const hostname = ncMatch[1];
+    const port = parseInt(ncMatch[2], 10);
+    if (port < 1 || port > 65535) throw new Error("Invalid nc port number");
+    const origin = `tcp://${hostname}:${port}`;
+    return { origin, hostname, port, candidate: `${hostname}:${port}` };
+  }
+  const hostPortMatch = String(text).match(/\b(?:connect(?:\s+to)?|challenge|instance|server|nc|netcat)\b[^.!?\n]{0,80}?([A-Za-z0-9][-A-Za-z0-9.]+):(\d{1,5})\b/i);
+  if (hostPortMatch) {
+    const hostname = hostPortMatch[1];
+    const port = parseInt(hostPortMatch[2], 10);
+    if (port < 1 || port > 65535) throw new Error("Invalid port number");
+    const origin = `tcp://${hostname}:${port}`;
+    return { origin, hostname, port, candidate: `${hostname}:${port}` };
+  }
+  throw new Error("No binary target (nc host port) found");
+}
+export function extractTarget(text) {
+  try { return { ...extractCompetitionTarget(text), run_type: "web" }; } catch (webError) {
+    try { return { ...extractBinaryTarget(text), run_type: "binary" }; } catch (binaryError) {
+      throw new Error(`No valid target found. Web: ${webError.message}. Binary: ${binaryError.message}.`);
+    }
+  }
+}
+export function detectRunType(text) {
+  const lower = String(text).toLowerCase();
+  if (/\b(?:buffer\s*overflow|overflow|exploit|binary|pwn|rop|shellcode|stack\s*smash|ret2libc|return[- ]oriented|format\s*string|heap\s*spray)\b/i.test(lower)) return "binary";
+  if (/\bnc\s+\S+\s+\d+\b/i.test(lower)) return "binary";
+  return "web";
+}
 function validateRunOption(value, fallback, name, maximum) {
   const selected = value ?? fallback;
   if (!Number.isInteger(selected) || selected < 1 || selected > maximum) throw new Error(`${name} must be an integer from 1 to ${maximum}`);
   return selected;
 }
-function createRunRecord({ targetOrigin, description, timeBudget, actionBudget, flagRegex }) {
+function createRunRecord({ targetOrigin, description, timeBudget, actionBudget, flagRegex, runType }) {
   return new Promise((resolveResult, rejectResult) => {
     const script = join(process.cwd(), "scripts", "create_competition_run.mjs");
-    const child = spawn(process.execPath, [script, "--target", targetOrigin, "--approve", "--description", description, "--time-budget", String(timeBudget), "--action-budget", String(actionBudget), "--flag-regex", flagRegex], {
+    const args = [script, "--target", targetOrigin, "--approve", "--description", description, "--time-budget", String(timeBudget), "--action-budget", String(actionBudget), "--flag-regex", flagRegex];
+    if (runType) args.push("--run-type", runType);
+    const child = spawn(process.execPath, args, {
       cwd: process.cwd(),
       env: { ...process.env, CTFC_PROJECT_ROOT: process.cwd() },
       stdio: ["ignore", "pipe", "pipe"],
@@ -169,20 +209,25 @@ async function startCompetitionRun(params, trustedText = null) {
   if (trustedText === null && (!lastUserChallenge || params.challenge_text !== lastUserChallenge)) throw new Error("Challenge text must come from the pasted user message");
   const text = params.challenge_text;
   if (!/\b(?:ctf|picoctf|challenge|flag|capture[\s-]*the[\s-]*flag)\b/i.test(text)) throw new Error("Message does not meet challenge activation criteria");
-  const target = extractCompetitionTarget(text);
-  if (params.target_url !== undefined && (typeof params.target_url !== "string" || params.target_url !== target.candidate)) throw new Error("target_url must match the extracted challenge target");
+  const target = extractTarget(text);
+  const runType = target.run_type;
+  if (runType === "web" && params.target_url !== undefined && (typeof params.target_url !== "string" || params.target_url !== target.candidate)) throw new Error("target_url must match the extracted challenge target");
   if (activeRun?.status === "active" && activeRun.target_origin === target.origin) return { run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, time_budget: activeRun.time_budget, action_budget: activeRun.action_budget, reused: true };
-  const timeBudget = validateRunOption(params.time_budget_minutes, 15, "Time budget", 30);
-  const actionBudget = validateRunOption(params.action_budget, trustedText !== null ? 60 : 20, "Action budget", 60);
+  const timeFallback = runType === "binary" ? 30 : 15;
+  const timeMax = runType === "binary" ? 45 : 30;
+  const actionFallback = runType === "binary" ? 100 : (trustedText !== null ? 60 : 20);
+  const actionMax = runType === "binary" ? 120 : 60;
+  const timeBudget = validateRunOption(params.time_budget_minutes, timeFallback, "Time budget", timeMax);
+  const actionBudget = validateRunOption(params.action_budget, actionFallback, "Action budget", actionMax);
   const flagRegex = params.flag_regex ?? DEFAULT_FLAG_REGEX;
   compileFlagRegex(flagRegex);
-  const recordPath = await createRunRecord({ targetOrigin: target.origin, description: text, timeBudget, actionBudget, flagRegex });
+  const recordPath = await createRunRecord({ targetOrigin: target.origin, description: text, timeBudget, actionBudget, flagRegex, runType });
   ingestCompetitionInputs(recordPath, text);
   if (activeRun?.status === "active" && activeRun.target_origin !== target.origin) activeRun = null;
   process.env.CTFC_COMPETITION_RUN_RECORD = recordPath;
   initializeCompetitionRun();
   extensionApi?.setActiveTools(COMPETITION_TOOL_NAMES);
-  return { run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, time_budget: activeRun.time_budget, action_budget: activeRun.action_budget };
+  return { run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, time_budget: activeRun.time_budget, action_budget: activeRun.action_budget, run_type: runType };
 }
 function sanitize(value, limit = MAX_INSPECT) {
   // Public previews are redacted; private evidence remains the verification source.
@@ -300,11 +345,13 @@ function capHypotheses() {
     const weakest = active.sort((a, b) => a.confidence - b.confidence)[0];
     weakest.retired = true;
     weakest.retired_reason = "capped at 3 active hypotheses";
+    weakest.retired_at = activeRun.actionCount;
     activeRun.retiredHypotheses.push({ ...weakest });
     activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((h) => h.id !== weakest.id);
     const idx = active.indexOf(weakest);
     if (idx >= 0) active.splice(idx, 1);
   }
+  activeRun.retiredHypotheses = activeRun.retiredHypotheses.slice(-20);
 }
 function promoteHypotheses() {
   const active = activeRun.hypothesisBoard.filter((h) => !h.retired).sort((a, b) => b.confidence - a.confidence);
@@ -314,6 +361,10 @@ function hypothesisBoardSummary() {
   const active = (activeRun?.hypothesisBoard ?? []).filter((h) => !h.retired);
   if (!active.length) return [];
   return active.map((h) => ({ id: h.id, rank: h.rank, family: h.family, branch: h.branch, confidence: Math.round(h.confidence * 100) / 100, summary: h.summary, next_experiment: h.next_experiment, supporting_count: h.supporting_evidence_ids.length, disconfirming_count: h.disconfirming_evidence_ids.length }));
+}
+function retiredHypothesesSummary() {
+  const retired = activeRun?.retiredHypotheses ?? [];
+  return retired.slice(-20).map((h) => ({ id: h.id, family: h.family, branch: h.branch, confidence: Math.round((h.confidence ?? 0) * 100) / 100, summary: h.summary ?? "", retired_reason: h.retired_reason ?? "", retired_at: h.retired_at ?? 0 }));
 }
 function spawnUnknownHypothesis() {
   const evidenceRecords = [...activeRun.evidenceRecords.values()];
@@ -364,14 +415,17 @@ function updateHypothesisBoard(reasoning, evidenceId, statusCode, outcome, body)
   if (h.confidence < HYPOTHESIS_MIN_CONFIDENCE) {
     h.retired = true;
     h.retired_reason = `confidence ${h.confidence.toFixed(2)} below threshold`;
+    h.retired_at = activeRun.actionCount;
     activeRun.retiredHypotheses.push({ ...h });
     activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((bh) => bh.id !== h.id);
   } else if (activeRun.familyBranchFailures[fbKey] >= HYPOTHESIS_MAX_FAILURES && h.supporting_evidence_ids.length < 2) {
     h.retired = true;
     h.retired_reason = `two failed ${family}/${branch} experiments without new evidence`;
+    h.retired_at = activeRun.actionCount;
     activeRun.retiredHypotheses.push({ ...h });
     activeRun.hypothesisBoard = activeRun.hypothesisBoard.filter((bh) => bh.id !== h.id);
   }
+  activeRun.retiredHypotheses = activeRun.retiredHypotheses.slice(-20);
   capHypotheses();
   promoteHypotheses();
   persistState();
@@ -574,6 +628,7 @@ function routeFamily(path) {
 function requestDecision(request) {
   if (activeRun.evidenceSequence === 0) return { allow: true };
   if (activeRun.hypothesisRoutePaths.has(request.path)) return { allow: false, reason: `Rejected repeated hypothesis route ${request.path}.` };
+  const alreadyRejected = activeRun.rejectedPaths.includes(request.path);
   const clues = evidenceRouteClues();
   const observed = clues.map((clue) => clue.path);
   const exact = clues.find((clue) => clue.path === request.path);
@@ -587,12 +642,27 @@ function requestDecision(request) {
   if (qualifyingHypothesis) {
     const score = request.reasoning.exploration_score;
     const justification = request.reasoning.exploration_justification;
-    if (score === undefined || !justification) return { allow: false, reason: `Rejected unknown route ${request.path}: provide exploration_score and exploration_justification.` };
+    if (score === undefined || !justification) {
+      if (alreadyRejected) return { allow: false, reason: `Path ${request.path} was already rejected by the exploration gate. Try a different approach.` };
+      activeRun.rejectedPaths.push(request.path);
+      activeRun.rejectedPaths = activeRun.rejectedPaths.slice(-50);
+      return { allow: false, reason: `Rejected unknown route ${request.path}: provide exploration_score and exploration_justification.` };
+    }
     const family = request.reasoning.route_family === "other" ? routeFamily(request.path) : request.reasoning.route_family;
     const repeatedFamily = activeRun.exploredRouteFamilies.has(family);
     const effectiveScore = repeatedFamily ? Math.max(0, score - 0.15) : score;
-    if (effectiveScore < 0.3 && activeRun.reasoning.current_hypothesis) return { allow: false, reason: `Rejected unknown route ${request.path}: exploration score must be at least 0.3 while an active hypothesis remains.` };
-    if (activeRun.explorationBudgetRemaining < 1) return { allow: false, reason: `Rejected unknown route ${request.path}: exploration budget is exhausted.` };
+    if (effectiveScore < 0.3 && activeRun.reasoning.current_hypothesis) {
+      if (alreadyRejected) return { allow: false, reason: `Path ${request.path} was already rejected by the exploration gate. Try a different approach.` };
+      activeRun.rejectedPaths.push(request.path);
+      activeRun.rejectedPaths = activeRun.rejectedPaths.slice(-50);
+      return { allow: false, reason: `Rejected unknown route ${request.path}: exploration score must be at least 0.3 while an active hypothesis remains.` };
+    }
+    if (activeRun.explorationBudgetRemaining < 1) {
+      if (alreadyRejected) return { allow: false, reason: `Path ${request.path} was already rejected by the exploration gate. Try a different approach.` };
+      activeRun.rejectedPaths.push(request.path);
+      activeRun.rejectedPaths = activeRun.rejectedPaths.slice(-50);
+      return { allow: false, reason: `Rejected unknown route ${request.path}: exploration budget is exhausted.` };
+    }
     const exploration = { score, effectiveScore, justification, family, repeatedFamily, beforeClues: new Set(observed) };
     activeRun.explorationBudgetUsed += 1;
     activeRun.explorationBudgetRemaining -= 1;
@@ -602,6 +672,9 @@ function requestDecision(request) {
     persistState();
     return { allow: true, hypothesisPath: request.path, exploration };
   }
+  if (alreadyRejected) return { allow: false, reason: `Path ${request.path} was already rejected by the exploration gate. Try a different approach.` };
+  activeRun.rejectedPaths.push(request.path);
+  activeRun.rejectedPaths = activeRun.rejectedPaths.slice(-50);
   return { allow: false, reason: `Rejected HTTP request to ${request.path}. ${detail}` };
 }
 
@@ -609,14 +682,19 @@ function loadRecord() {
   const recordPath = process.env.CTFC_COMPETITION_RUN_RECORD;
   if (!recordPath || !isAbsolute(recordPath) || !existsSync(recordPath) || lstatSync(recordPath).isSymbolicLink()) throw new Error("Competition run record is missing or unsafe");
   const record = JSON.parse(readFileSync(recordPath, "utf8"));
-  if (!record.run_id || !record.approved || !record.target_origin || !record.flag_regex || !record.paths?.run_root || !record.paths.state || !record.paths.evidence || !record.paths.private || !record.paths.cookies || !record.paths.result) throw new Error("Incomplete competition run record");
+  if (!record.run_id || !record.approved || !record.target_origin || !record.flag_regex || !record.paths?.run_root || !record.paths.state || !record.paths.evidence || !record.paths.private || !record.paths.cookies || !record.paths.work || !record.paths.result) throw new Error("Incomplete competition run record");
   const target = new URL(record.target_origin);
-  if (!["http:", "https:"].includes(target.protocol) || target.username || target.password || target.pathname !== "/" || target.search || target.hash) throw new Error("Invalid competition target origin");
+  const isHttp = ["http:", "https:"].includes(target.protocol);
+  const isTcp = target.protocol === "tcp:";
+  if (!isHttp && !isTcp) throw new Error("Invalid competition target origin");
+  if (isHttp && (target.username || target.password || target.pathname !== "/" || target.search || target.hash)) throw new Error("Invalid competition target origin");
+  if (isTcp && (target.username || target.password || target.hash)) throw new Error("Invalid binary target origin");
+  const runType = record.run_type ?? (isTcp ? "binary" : "web");
   const runRoot = resolve(record.paths.run_root);
-  const paths = [record.paths.state, record.paths.cookies, record.paths.evidence, record.paths.private, record.paths.result];
+  const paths = [record.paths.state, record.paths.cookies, record.paths.evidence, record.paths.private, record.paths.work, record.paths.result];
   if (!paths.every((path) => isAbsolute(path) && (resolve(path) === runRoot || inside(runRoot, resolve(path))))) throw new Error("Competition runtime path escapes run root");
   if (record.source_root && (!isAbsolute(record.source_root) || !existsSync(record.source_root) || !lstatSync(record.source_root).isDirectory())) throw new Error("Competition source directory is invalid");
-  return { ...record, target, runRoot, flagPattern: compileFlagRegex(record.flag_regex) };
+  return { ...record, target, runRoot, flagPattern: compileFlagRegex(record.flag_regex), runType };
 }
 function loadCookies(record) {
   if (!existsSync(record.paths.cookies)) return new Map();
@@ -643,7 +721,7 @@ function loadEvidence(record, state) {
   return { map, prior };
 }
 function loadState(record) {
-  if (!existsSync(record.paths.state)) return { action_count: 0, evidence_sequence: 0, last_evidence_hash: null, status: "active", started_at: null, deadline_at: null };
+  if (!existsSync(record.paths.state)) return { action_count: 0, evidence_sequence: 0, last_evidence_hash: null, status: "active", started_at: null, deadline_at: null, work_files: [] };
   if (lstatSync(record.paths.state).isSymbolicLink()) throw new Error("Competition state is unsafe");
   let state; try { state = JSON.parse(readFileSync(record.paths.state, "utf8")); } catch { throw new Error("Competition state is corrupted"); }
   if (state.run_id !== record.run_id || state.target_origin !== record.target_origin) throw new Error("Competition state does not match run");
@@ -654,13 +732,14 @@ function loadState(record) {
 }
 export function initializeCompetitionRun() {
   const record = loadRecord();
+  if (!existsSync(record.paths.work)) mkdirSync(record.paths.work, { recursive: true, mode: 0o700 });
   retireExpiredRun();
   if (activeRun?.status === "active" && activeRun.run_id !== record.run_id) throw new Error("A different competition run is already active");
   const state = loadState(record); const isNewRun = state.started_at == null; const startedAt = state.started_at ?? Date.now(); const deadlineAt = state.deadline_at ?? startedAt + record.time_budget * 60000;
   if (browserContext && activeRun?.run_id !== record.run_id) void closeBrowser();
   const explorationBudget = Number.isSafeInteger(state.exploration_budget) && state.exploration_budget > 0 ? state.exploration_budget : DEFAULT_EXPLORATION_BUDGET;
   const explorationUsed = Number.isSafeInteger(state.exploration_budget_used) && state.exploration_budget_used >= 0 ? state.exploration_budget_used : 0;
-  activeRun = { ...record, insecure_tls: record.insecure_tls === true, status: state.status ?? "active", startedAt, deadlineAt, actionCount: state.action_count ?? 0, toolCallCount: state.tool_call_count ?? 0, analysisActionCount: state.analysis_action_count ?? 0, analysisActionFingerprints: new Set(state.analysis_action_fingerprints ?? []), hypothesisRoutePaths: new Set(state.hypothesis_route_paths ?? []), unavailableCapabilities: new Set(state.unavailable_capabilities ?? []), explorationBudget, explorationBudgetUsed: explorationUsed, explorationBudgetRemaining: Math.max(0, explorationBudget - explorationUsed), exploredRouteFamilies: new Set(state.explored_route_families ?? []), explorationLog: Array.isArray(state.exploration_log) ? state.exploration_log : [], hypothesisBoard: Array.isArray(state.hypothesis_board) ? state.hypothesis_board : [], retiredHypotheses: Array.isArray(state.retired_hypotheses) ? state.retired_hypotheses : [], familyBranchFailures: state.family_branch_failures ?? {}, interactive: process.env.CTFC_COMPETITION_INTERACTIVE === "1", evidenceSequence: state.evidence_sequence ?? 0, lastEvidenceHash: state.lastEvidenceHash ?? state.last_evidence_hash ?? null, report: state.report ?? { last_progress: "Run started.", resume_from: "" }, reasoning: state.reasoning ?? { current_hypothesis: "", confidence: 0, supporting_evidence: [], untested_experiments: [], tested_experiments: [] }, evidenceRecords: state.evidenceRecords ?? new Map(), cookies: loadCookies(record), requiredEvidenceInspection: state.required_evidence_inspection ?? null, sessionMutationEvidenceId: state.session_mutation_evidence_id ?? null, verified: null };
+  activeRun = { ...record, insecure_tls: record.insecure_tls === true, status: state.status ?? "active", startedAt, deadlineAt, actionCount: state.action_count ?? 0, toolCallCount: state.tool_call_count ?? 0, analysisActionCount: state.analysis_action_count ?? 0, analysisActionFingerprints: new Set(state.analysis_action_fingerprints ?? []), hypothesisRoutePaths: new Set(state.hypothesis_route_paths ?? []), rejectedPaths: Array.isArray(state.rejected_paths) ? state.rejected_paths : [], workFiles: Array.isArray(state.work_files) ? state.work_files : [], unavailableCapabilities: new Set(state.unavailable_capabilities ?? []), explorationBudget, explorationBudgetUsed: explorationUsed, explorationBudgetRemaining: Math.max(0, explorationBudget - explorationUsed), exploredRouteFamilies: new Set(state.explored_route_families ?? []), explorationLog: Array.isArray(state.exploration_log) ? state.exploration_log : [], hypothesisBoard: Array.isArray(state.hypothesis_board) ? state.hypothesis_board : [], retiredHypotheses: Array.isArray(state.retired_hypotheses) ? state.retired_hypotheses : [], familyBranchFailures: state.family_branch_failures ?? {}, interactive: process.env.CTFC_COMPETITION_INTERACTIVE === "1", evidenceSequence: state.evidence_sequence ?? 0, lastEvidenceHash: state.lastEvidenceHash ?? state.last_evidence_hash ?? null, report: state.report ?? { last_progress: "Run started.", resume_from: "" }, reasoning: state.reasoning ?? { current_hypothesis: "", confidence: 0, supporting_evidence: [], untested_experiments: [], tested_experiments: [] }, evidenceRecords: state.evidenceRecords ?? new Map(), cookies: loadCookies(record), requiredEvidenceInspection: state.required_evidence_inspection ?? null, sessionMutationEvidenceId: state.session_mutation_evidence_id ?? null, verified: null };
   retireExpiredRun();
   if (isNewRun) writeLiveLine(startedAt, "Run started");
   scheduleWatchdog();
@@ -695,7 +774,7 @@ function scheduleWatchdog() {
 function persistState() {
   activeRun.report.exploration_budget_used = activeRun.explorationBudgetUsed;
   activeRun.report.exploration_budget_remaining = activeRun.explorationBudgetRemaining;
-  atomicWrite(activeRun.paths.state, `${JSON.stringify({ run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, started_at: activeRun.startedAt, deadline_at: activeRun.deadlineAt, action_count: activeRun.actionCount, tool_call_count: activeRun.toolCallCount, analysis_action_count: activeRun.analysisActionCount, analysis_action_fingerprints: [...activeRun.analysisActionFingerprints], hypothesis_route_paths: [...activeRun.hypothesisRoutePaths], unavailable_capabilities: [...activeRun.unavailableCapabilities], exploration_budget: activeRun.explorationBudget, exploration_budget_used: activeRun.explorationBudgetUsed, exploration_budget_remaining: activeRun.explorationBudgetRemaining, explored_route_families: [...activeRun.exploredRouteFamilies], exploration_log: activeRun.explorationLog.slice(-64), hypothesis_board: activeRun.hypothesisBoard, retired_hypotheses: activeRun.retiredHypotheses.slice(-64), family_branch_failures: activeRun.familyBranchFailures, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, report: activeRun.report, reasoning: activeRun.reasoning, required_evidence_inspection: activeRun.requiredEvidenceInspection, session_mutation_evidence_id: activeRun.sessionMutationEvidenceId }, null, 2)}\n`);
+  atomicWrite(activeRun.paths.state, `${JSON.stringify({ run_id: activeRun.run_id, target_origin: activeRun.target_origin, status: activeRun.status, started_at: activeRun.startedAt, deadline_at: activeRun.deadlineAt, action_count: activeRun.actionCount, tool_call_count: activeRun.toolCallCount, analysis_action_count: activeRun.analysisActionCount, analysis_action_fingerprints: [...activeRun.analysisActionFingerprints], hypothesis_route_paths: [...activeRun.hypothesisRoutePaths], rejected_paths: activeRun.rejectedPaths.slice(-50), work_files: activeRun.workFiles.slice(-256), unavailable_capabilities: [...activeRun.unavailableCapabilities], exploration_budget: activeRun.explorationBudget, exploration_budget_used: activeRun.explorationBudgetUsed, exploration_budget_remaining: activeRun.explorationBudgetRemaining, explored_route_families: [...activeRun.exploredRouteFamilies], exploration_log: activeRun.explorationLog.slice(-64), hypothesis_board: activeRun.hypothesisBoard, retired_hypotheses: activeRun.retiredHypotheses.slice(-64), family_branch_failures: activeRun.familyBranchFailures, evidence_sequence: activeRun.evidenceSequence, last_evidence_hash: activeRun.lastEvidenceHash, report: activeRun.report, reasoning: activeRun.reasoning, required_evidence_inspection: activeRun.requiredEvidenceInspection, session_mutation_evidence_id: activeRun.sessionMutationEvidenceId }, null, 2)}\n`);
 }
 function retireExpiredRun() {
   if (!activeRun || activeRun.status !== "active" || Date.now() < activeRun.deadlineAt) return false;
@@ -814,7 +893,7 @@ function writeEvidence(entry, body) {
   if (entry.tool === "http_request" || entry.tool === "websocket_exchange" || entry.tool === "browser_action")
     updateHypothesisBoard(entry.reasoning, evidenceId, entry.status_code, entry.outcome, body);
   persistState();
-  return { evidence_id: evidenceId, outcome: entry.outcome, status_code: entry.status_code ?? null, transport_error: entry.transport_error ?? null, response_bytes: bytes.length, preview: entry.preview ?? "", content_type: entry.content_type ?? null, reasoning: entry.reasoning ?? null, hypothesis_board: hypothesisBoardSummary() };
+  return { evidence_id: evidenceId, outcome: entry.outcome, status_code: entry.status_code ?? null, transport_error: entry.transport_error ?? null, response_bytes: bytes.length, preview: entry.preview ?? "", content_type: entry.content_type ?? null, reasoning: entry.reasoning ?? null, hypothesis_board: hypothesisBoardSummary(), retired_hypotheses: retiredHypothesesSummary() };
 }
 function cookieHeader(url) { return [...activeRun.cookies.values()].filter((cookie) => cookie.domain === url.hostname && url.pathname.startsWith(cookie.path) && (!cookie.secure || url.protocol === "https:")).map((cookie) => `${cookie.name}=${cookie.value}`).join("; "); }
 function storeCookies(response, url) {
@@ -1377,7 +1456,7 @@ function searchSource(params) {
   return { ...writeEvidence({ tool: "search_source", outcome: "completed", preview: sanitize(body, 1024), source_path: source.path }, body), ...result };
 }
 
-const executables = { file: ["/usr/bin/file", "/bin/file"], strings: ["/usr/bin/strings", "/bin/strings"], readelf: ["/usr/bin/readelf", "/opt/homebrew/bin/readelf"], objdump: ["/usr/bin/objdump", "/opt/homebrew/bin/objdump"], nm: ["/usr/bin/nm", "/usr/bin/nm-classic", "/opt/homebrew/bin/nm"], sha256: ["/usr/bin/shasum", "/bin/shasum"] };
+const executables = { file: ["/usr/bin/file", "/bin/file"], strings: ["/usr/bin/strings", "/bin/strings"], readelf: ["/usr/bin/readelf", "/opt/homebrew/bin/readelf"], objdump: ["/usr/bin/objdump", "/opt/homebrew/bin/objdump"], nm: ["/usr/bin/nm", "/usr/bin/nm-classic", "/opt/homebrew/bin/nm"], sha256: ["/usr/bin/shasum", "/bin/shasum"], xxd: ["/usr/bin/xxd", "/opt/homebrew/bin/xxd"], hexdump: ["/usr/bin/hexdump", "/opt/homebrew/bin/hexdump"], base64: ["/usr/bin/base64", "/opt/homebrew/bin/base64"], grep: ["/usr/bin/grep", "/bin/grep"], ltrace: ["/opt/homebrew/bin/ltrace", "/usr/local/bin/ltrace", "/usr/bin/ltrace"], strace: ["/opt/homebrew/bin/strace", "/usr/local/bin/strace", "/usr/bin/strace"], python3: ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"], dd: ["/bin/dd", "/usr/bin/dd"], unzip: ["/usr/bin/unzip", "/opt/homebrew/bin/unzip"], tar: ["/usr/bin/tar", "/bin/tar"], head: ["/usr/bin/head", "/bin/head"], tail: ["/usr/bin/tail", "/bin/tail"], wc: ["/usr/bin/wc", "/bin/wc"], sort: ["/usr/bin/sort", "/bin/sort"], cut: ["/usr/bin/cut", "/bin/cut"], tr: ["/usr/bin/tr", "/bin/tr"] };
 async function closeBrowser() {
   const context = browserContext;
   const browser = browserInstance;
@@ -1504,7 +1583,7 @@ async function browserAction(params) {
   }
 }
 function localCommand(params) {
-  ensureActive(); if (!activeRun.source_root) throw new Error("Source analysis requires an optional source directory"); if (!Object.hasOwn(executables, params.profile)) throw new Error("Invalid source analysis profile"); const timeout = Number(params.timeout_ms); if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid timeout"); if (!Array.isArray(params.paths) || params.paths.length < 1 || params.paths.length > 8) throw new Error("Invalid source analysis paths"); const sourceRoot = realpathSync(activeRun.source_root); const paths = params.paths.map((path) => { if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) throw new Error("Unsafe source path"); const target = resolve(sourceRoot, path); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("Source path escapes supplied directory"); rejectSymlinks(sourceRoot, target); return target; }); const executable = executables[params.profile].find((path) => existsSync(path)); if (!executable) throw new Error("Source analysis executable unavailable"); const args = Array.isArray(params.args) ? params.args : []; if (args.length > 16 || args.some((arg) => typeof arg !== "string" || arg.length > 256)) throw new Error("Invalid source analysis arguments"); const commandArgs = params.profile === "sha256" ? ["-a", "256", ...paths] : [...args, ...paths]; consumeAction(); return new Promise((resolveResult) => { const child = spawn(executable, commandArgs, { cwd: sourceRoot, shell: false, env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" } }); const out = []; let size = 0; const collect = (chunk) => { size += chunk.length; if (size <= MAX_BODY) out.push(chunk); else child.kill("SIGTERM"); }; child.stdout.on("data", collect); child.stderr.on("data", collect); const timer = setTimeout(() => child.kill("SIGTERM"), timeout); child.on("close", (code, signal) => { clearTimeout(timer); const body = Buffer.concat(out); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: size > MAX_BODY ? "output_limit" : signal ? "timeout" : code === 0 ? "completed" : "error", exit_code: code, preview: sanitize(body.toString("utf8")) }, body)); }); child.on("error", (error) => { clearTimeout(timer); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: "error", preview: sanitize(error.message) }, error.message)); }); }); }
+  ensureActive(); if (!activeRun.source_root) throw new Error("Source analysis requires an optional source directory"); if (!Object.hasOwn(executables, params.profile)) throw new Error("Invalid source analysis profile"); const timeout = Number(params.timeout_ms); if (!Number.isInteger(timeout) || timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT) throw new Error("Invalid timeout"); if (!Array.isArray(params.paths) || params.paths.length < 1 || params.paths.length > 8) throw new Error("Invalid source analysis paths"); const sourceRoot = realpathSync(activeRun.source_root); const paths = params.paths.map((path) => { if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) throw new Error("Unsafe source path"); const target = resolve(sourceRoot, path); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("Source path escapes supplied directory"); rejectSymlinks(sourceRoot, target); return target; }); const executable = executables[params.profile].find((path) => existsSync(path)); if (!executable) throw new Error("Source analysis executable unavailable"); const args = Array.isArray(params.args) ? params.args : []; if (args.length > 16 || args.some((arg) => typeof arg !== "string" || arg.length > 256)) throw new Error("Invalid source analysis arguments"); if (params.profile === "python3") { const oneLiner = args.length === 2 && args[0] === "-c"; const scriptMode = args.length === 1 && args[0] !== "-c"; if (!oneLiner && !scriptMode) throw new Error("python3 only allows -c one-liner mode or a script from the work/ directory"); if (scriptMode) { const script = args[0]; if (isAbsolute(script) || script.includes("\\") || script.split("/").includes("..")) throw new Error("python3 script must be inside the run directory"); const target = resolve(sourceRoot, script); const resolved = existsSync(target) ? realpathSync(target) : target; if (!(resolved === sourceRoot || inside(sourceRoot, resolved))) throw new Error("python3 script escapes the run directory"); rejectSymlinks(sourceRoot, target); } } const commandArgs = params.profile === "sha256" ? ["-a", "256", ...paths] : [...args, ...paths]; consumeAction(); return new Promise((resolveResult) => { const child = spawn(executable, commandArgs, { cwd: sourceRoot, shell: false, env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" } }); const out = []; let size = 0; const collect = (chunk) => { size += chunk.length; if (size <= MAX_BODY) out.push(chunk); else child.kill("SIGTERM"); }; child.stdout.on("data", collect); child.stderr.on("data", collect); const timer = setTimeout(() => child.kill("SIGTERM"), timeout); child.on("close", (code, signal) => { clearTimeout(timer); const body = Buffer.concat(out); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: size > MAX_BODY ? "output_limit" : signal ? "timeout" : code === 0 ? "completed" : "error", exit_code: code, preview: sanitize(body.toString("utf8")) }, body)); }); child.on("error", (error) => { clearTimeout(timer); resolveResult(writeEvidence({ tool: "run_local_command", profile: params.profile, outcome: "error", preview: sanitize(error.message) }, error.message)); }); }); }
 
 function unavailableCapabilityKind(error) {
   const message = error instanceof Error ? error.message : String(error ?? "");
@@ -1524,6 +1603,192 @@ function capabilityAwareExecute(toolName, execute) {
     }
   };
 }
+function writeWorkFileParams(params) {
+  const allowed = new Set(["filename", "content", "description"]);
+  if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("Unsupported write_work_file parameter");
+  if (typeof params.filename !== "string" || !params.filename || params.filename.length > 64 || /[\/\\]/.test(params.filename) || params.filename.includes("..")) throw new Error("Invalid filename");
+  if (typeof params.content !== "string" || Buffer.byteLength(params.content) > 65536) throw new Error("Invalid content");
+  if (typeof params.description !== "string" || !params.description || params.description.length > 256) throw new Error("Invalid description");
+  return { filename: params.filename, content: params.content, description: params.description };
+}
+function writeWorkFile(params) {
+  ensureActive(); const { filename, content, description } = writeWorkFileParams(params); consumeAction();
+  const workRoot = resolve(activeRun.paths.work);
+  const targetPath = resolve(workRoot, filename);
+  if (!inside(workRoot, targetPath)) throw new Error("Filename escapes work directory");
+  rejectSymlinks(workRoot, targetPath);
+  const bytes = Buffer.from(content, "utf8");
+  atomicWrite(targetPath, bytes);
+  if (!activeRun.workFiles.includes(filename)) { activeRun.workFiles.push(filename); activeRun.workFiles = activeRun.workFiles.slice(-256); }
+  const publicEvidence = { filename, description, byte_count: bytes.length, outcome: "file_written" };
+  const evidence = writeEvidence({ tool: "write_work_file", ...publicEvidence, preview: sanitize(JSON.stringify(publicEvidence), 512) }, JSON.stringify({ ...publicEvidence, content_sha256: hash(bytes) }));
+  persistState();
+  return { evidence_id: evidence.evidence_id, outcome: "file_written", path: targetPath, filename, byte_count: bytes.length };
+}
+function capOutputBytes(buffer, limit = 65536) {
+  const marker = "[TRUNCATED]";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (buffer.length <= limit) return buffer;
+  return Buffer.concat([buffer.slice(0, limit - markerBytes), Buffer.from(marker, "utf8")]);
+}
+function runPythonInputFiles(raw) {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error("Invalid input_files");
+  if (raw.length > 4) throw new Error("input_files exceeds 4 entries");
+  return raw.map((name) => {
+    if (typeof name !== "string" || !name || name.length > 64 || /[\/\\]/.test(name) || name.includes("..")) throw new Error("Invalid input_files entry");
+    return name;
+  });
+}
+function preparePythonInputFiles(names) {
+  if (!names.length) return [];
+  const workRoot = resolve(activeRun.paths.work);
+  const candidates = [];
+  if (activeRun.source_root) candidates.push({ name: "source", root: realpathSync(activeRun.source_root) });
+  candidates.push({ name: "private", root: realpathSync(activeRun.paths.private) });
+  candidates.push({ name: "work", root: workRoot });
+  const loaded = [];
+  let totalBytes = 0;
+  for (const name of names) {
+    const from = candidates.find((candidate) => existsSync(resolve(candidate.root, name)));
+    if (!from) throw new Error(`Input file not found in source, private, or work directories: ${name}`);
+    const sourceTarget = resolve(from.root, name);
+    if (!inside(from.root, sourceTarget)) throw new Error("Input file escapes supplier directory");
+    rejectSymlinks(from.root, sourceTarget);
+    const target = resolve(workRoot, name);
+    rejectSymlinks(workRoot, target);
+    const bytes = lstatSync(sourceTarget).size;
+    totalBytes += bytes;
+    if (totalBytes > 10 * 1024 * 1024) throw new Error("Combined input files exceed 10 MB");
+    if (!existsSync(target)) atomicWrite(target, readFileSync(sourceTarget));
+    loaded.push({ name, source: from.name, bytes });
+  }
+  return loaded;
+}
+function runPythonParams(params) {
+  const allowed = new Set(["filename", "args", "stdin_text", "timeout_seconds", "input_files"]);
+  if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("Unsupported run_python parameter");
+  if (typeof params.filename !== "string" || !params.filename || params.filename.length > 64 || /[\/\\]/.test(params.filename) || params.filename.includes("..")) throw new Error("Invalid filename");
+  const args = Array.isArray(params.args) ? params.args : [];
+  if (args.length > 8 || args.some((arg) => typeof arg !== "string" || arg.length > 256 || /[;&|`$><\\\n\r]/.test(arg))) throw new Error("Invalid args");
+  const stdinText = typeof params.stdin_text === "string" ? params.stdin_text : "";
+  if (Buffer.byteLength(stdinText, "utf8") > 4096) throw new Error("Invalid stdin_text");
+  const timeout = Number(params.timeout_seconds ?? 10);
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30) throw new Error("Invalid timeout_seconds");
+  const inputFiles = runPythonInputFiles(params.input_files);
+  return { filename: params.filename, args, stdinText, timeout, inputFiles };
+}
+function runPython(params) {
+  ensureActive(); const { filename, args, stdinText, timeout, inputFiles } = runPythonParams(params); consumeAction();
+  const workRoot = resolve(activeRun.paths.work);
+  const targetPath = resolve(workRoot, filename);
+  if (!inside(workRoot, targetPath)) throw new Error("Filename escapes work directory");
+  rejectSymlinks(workRoot, targetPath);
+  if (!existsSync(targetPath) || !lstatSync(targetPath).isFile()) throw new Error("Script file not found in work directory");
+  const loaded = preparePythonInputFiles(inputFiles);
+  const started = Date.now();
+  const child = spawnSync("python3", [targetPath, ...args], {
+    cwd: workRoot,
+    input: stdinText,
+    shell: false,
+    env: { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C" },
+    timeout: timeout * 1000,
+    maxBuffer: 3 * 65536,
+  });
+  const elapsed = Date.now() - started;
+  const stdoutRaw = child.stdout ?? Buffer.alloc(0);
+  const stderrRaw = child.stderr ?? Buffer.alloc(0);
+  const stdoutBuf = capOutputBytes(stdoutRaw, 65536);
+  const stderrBuf = capOutputBytes(stderrRaw, 65536);
+  const stdout = stdoutBuf.toString("utf8");
+  const stderr = stderrBuf.toString("utf8");
+  const timedOut = child.error?.code === "ETIMEDOUT" || (child.status === null && child.signal !== null);
+  const outcome = timedOut ? "timeout" : (child.status === 0 ? "success" : "error");
+  const exitCode = child.status ?? null;
+  const publicEvidence = { filename, input_files: loaded, outcome, exit_code: exitCode, elapsed_ms: elapsed, stdout_preview: sanitize(stdout, 256), stderr_preview: sanitize(stderr, 256), stdout_truncated: stdoutBuf.length < stdoutRaw.length, stderr_truncated: stderrBuf.length < stderrRaw.length };
+  const privateBody = { filename, args, stdin_text: stdinText, outcome, exit_code: exitCode, elapsed_ms: elapsed, stdout, stdout_sha256: hash(stdoutBuf), stderr, stderr_sha256: hash(stderrBuf) };
+  const evidence = writeEvidence({ tool: "run_python", ...publicEvidence, preview: sanitize(JSON.stringify(publicEvidence), 512) }, JSON.stringify(privateBody));
+  persistState();
+  return { evidence_id: evidence.evidence_id, outcome, exit_code: exitCode, stdout, stderr, elapsed_ms: elapsed };
+}
+function tcpConnectParams(params) {
+  ensureActive();
+  if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("Malformed tcp_connect input");
+  const allowed = new Set(["host", "port", "data", "timeout_seconds", "read_bytes"]);
+  if (Object.keys(params).some((key) => !allowed.has(key))) throw new Error("Unsupported tcp_connect parameter");
+  const host = String(params.host ?? "");
+  if (!host || host.length > 253) throw new Error("Invalid host");
+  if (host.toLowerCase() !== activeRun.target.hostname.toLowerCase()) throw new Error("TCP host must be the authorized origin host");
+  const port = Number(params.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid port");
+  let payload = Buffer.from((params.data ?? ""), "utf8");
+  if (typeof params.data === "string" && /^0x/i.test(params.data)) {
+    const hex = params.data.replace(/^0x/i, "");
+    if (!/^[0-9a-fA-F]*$/.test(hex) || hex.length % 2 !== 0) throw new Error("Invalid hex data");
+    payload = Buffer.from(hex, "hex");
+  } else if (typeof params.data === "string" && /\\x[0-9a-fA-F]{2}/i.test(params.data)) {
+    const decoded = params.data
+      .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\");
+    payload = Buffer.from(decoded, "latin1");
+  }
+  if (payload.length > 65536) throw new Error("Data exceeds 65536 bytes");
+  const timeout = Number(params.timeout_seconds ?? 10);
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30) throw new Error("Invalid timeout_seconds");
+  const readBytes = Number(params.read_bytes ?? 4096);
+  if (!Number.isInteger(readBytes) || readBytes < 1 || readBytes > 65536) throw new Error("Invalid read_bytes");
+  return { host, port, payload, timeout, readBytes };
+}
+function tcpSocketExchange(request) {
+  return new Promise((resolveResult) => {
+    const socket = net.createConnection({ host: request.host, port: request.port });
+    const chunks = [];
+    let total = 0;
+    let sent = 0;
+    let settled = false;
+    let outcome = "error";
+    let error = "";
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.destroy(); } catch {}
+      resolveResult({ outcome, error, sent, received: total, response: Buffer.concat(chunks.length ? chunks : [Buffer.alloc(0)]) });
+    };
+    const timer = setTimeout(() => { outcome = "timeout"; error = "TCP response timeout"; finish(); }, request.timeout * 1000);
+    socket.setTimeout(request.timeout * 1000);
+    socket.on("timeout", () => { if (!settled) { outcome = "timeout"; error = "TCP response timeout"; finish(); } });
+    socket.on("connect", () => { if (request.payload.length) { socket.write(request.payload); sent = request.payload.length; } });
+    socket.on("data", (chunk) => {
+      if (settled) return;
+      const room = Math.max(0, request.readBytes - total);
+      if (room <= 0) { finish(); return; }
+      const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
+      chunks.push(slice);
+      total += slice.length;
+      if (total >= request.readBytes) finish();
+    });
+    socket.on("end", () => { if (!settled) { outcome = "completed"; finish(); } });
+    socket.on("close", () => finish());
+    socket.on("error", (err) => { outcome = "error"; error = err instanceof Error ? err.message : String(err); finish(); });
+  });
+}
+async function tcpConnect(params) {
+  const request = tcpConnectParams(params);
+  consumeAction();
+  const started = Date.now();
+  const res = await tcpSocketExchange(request);
+  const body = res.response.subarray(0, 65536);
+  const text = body.toString("utf8");
+  const hex = body.toString("hex");
+  const publicEvidence = { outcome: res.outcome, host: request.host, port: request.port, error: res.error || null, duration_ms: Date.now() - started, bytes_sent: res.sent, bytes_read: res.received, response_preview: sanitize(text, 256), response_hex_preview: sanitize(hex, 256) };
+  const privateBody = { outcome: res.outcome, error: res.error || null, bytes_sent: res.sent, bytes_read: res.received, response_text: text, response_hex: hex, response_sha256: hash(body) };
+  const evidence = writeEvidence({ tool: "tcp_connect", ...publicEvidence, preview: sanitize(JSON.stringify(publicEvidence), 512) }, JSON.stringify(privateBody));
+  return { evidence_id: evidence.evidence_id, outcome: res.outcome, error: res.error || null, bytes_sent: res.sent, bytes_read: res.received, response_text: text, response_hex: hex };
+}
 function textResult(value) { if (activeRun) { activeRun.toolCallCount += 1; persistState(); } return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }; }
   const browserActionTool = defineTool({ name: "browser_action", label: "Browser Action", description: "Use one persistent, exact-origin browser context for bounded DOM interaction, storage, screenshots, and evidence-bound script evaluation. Popups and downloads are blocked.", parameters: Type.Object({ action: Type.Union([Type.Literal("goto"), Type.Literal("click"), Type.Literal("type"), Type.Literal("submit"), Type.Literal("screenshot"), Type.Literal("eval"), Type.Literal("get_storage"), Type.Literal("set_storage"), Type.Literal("wait"), Type.Literal("close")]), selector: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()), storage_type: Type.Optional(Type.Union([Type.Literal("localStorage"), Type.Literal("sessionStorage")])), storage_key: Type.Optional(Type.String()), storage_value: Type.Optional(Type.Unknown()), timeout_ms: Type.Optional(Type.Number()), wait_for: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(await browserAction(params)); } });
   const httpRequestTool = defineTool({ name: "http_request", label: "HTTP Request", description: "Perform one bounded same-origin Web request and retain its evidence with required reasoning. Supports bounded raw_xml POST bodies with an XML Content-Type. For an observed multipart form with no hidden inputs, omit multipart.evidence_form_fields; source evidence plus the observed file field is sufficient. source_evidence_id is the page containing the observed form; submit multipart POST to that form's observed action path, not necessarily the page path.", parameters: Type.Object({ method: Type.Union([Type.Literal("GET"), Type.Literal("POST")]), path: Type.String(), query: Type.Optional(Type.Record(Type.String(), Type.String())), form: Type.Optional(Type.Record(Type.String(), Type.String())), raw_xml: Type.Optional(Type.String()), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())), json: Type.Optional(Type.Record(Type.String(), Type.Unknown())), multipart: Type.Optional(Type.Object({ source_evidence_id: Type.String(), file: Type.Object({ field_name: Type.String(), filename: Type.String(), content_type: Type.String(), content_base64: Type.String() }), fields: Type.Optional(Type.Record(Type.String(), Type.String())), evidence_form_fields: Type.Optional(Type.Record(Type.String(), Type.String())) })), headers: Type.Optional(Type.Record(Type.String(), Type.String())), reasoning: Type.Object({ evidence_summary: Type.Array(Type.String()), leading_hypothesis: Type.String(), supporting_evidence: Type.Array(Type.String()), experiment: Type.String(), expected_observation: Type.String(), confidence: Type.Number(), untested_experiments: Type.Optional(Type.Array(Type.String())), exploration_score: Type.Optional(Type.Number()), exploration_justification: Type.Optional(Type.String()), route_family: Type.Optional(Type.String()), next_experiment: Type.Optional(Type.String()) }), action_kind: Type.Union([Type.Literal("recon"), Type.Literal("login"), Type.Literal("authenticated_request"), Type.Literal("submit"), Type.Literal("trigger")]), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await httpRequest(params)); } });
@@ -1533,19 +1798,22 @@ function textResult(value) { if (activeRun) { activeRun.toolCallCount += 1; pers
 const listSourceTool = defineTool({ name: "list_source", label: "List Source", description: "List one bounded supplied-source directory.", parameters: Type.Object({ path: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(listSource(params)); } });
  const readSourceTool = defineTool({ name: "read_source", label: "Read Source", description: "Read one bounded range from a supplied source file.", parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(readSource(params)); } });
  const searchSourceTool = defineTool({ name: "search_source", label: "Search Source", description: "Search supplied source recursively for one bounded literal string.", parameters: Type.Object({ query: Type.String(), path: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(searchSource(params)); } });
-  const computeDigestTool = defineTool({ name: "compute_digest", label: "Compute Digest", description: "Compute one bounded deterministic digest without source access or HTTP.", parameters: Type.Object({ algorithm: Type.Union([Type.Literal("md5"), Type.Literal("sha1"), Type.Literal("sha256")]), text: Type.String(), purpose: Type.String() }), async execute(_id, params) { return textResult(computeDigest(params)); } });
+  const computeDigestTool = defineTool({ name: "compute_digest", label: "Compute Digest", description: "Compute one bounded deterministic digest without source access or HTTP.", parameters: Type.Object({ algorithm: Type.Union([Type.Literal("md5"), Type.Literal("sha1"), Type.Literal("sha256"), Type.Literal("base64_encode"), Type.Literal("base64_decode")]), text: Type.String(), purpose: Type.String() }), async execute(_id, params) { return textResult(computeDigest(params)); } });
   const deriveBinaryEvidenceTool = defineTool({ name: "derive_binary_evidence", label: "Derive Binary Evidence", description: "Derive bounded private evidence from retained bytes using one fixed XOR transform.", parameters: Type.Object({ source_evidence_id: Type.String(), operation: Type.Literal("xor_repeat"), offset: Type.Number(), length: Type.Number(), key_base64: Type.String() }), async execute(_id, params) { return textResult(deriveBinaryEvidence(params)); } });
 const replaceSessionCookieTool = defineTool({ name: "replace_session_cookie", label: "Replace Session Cookie", description: "Replace one named cookie for the exact active target origin and retain redacted evidence.", parameters: Type.Object({ hypothesis_id: Type.String(), cookie_name: Type.String(), cookie_value: Type.String(), path: Type.Optional(Type.String()) }), async execute(_id, params) { return textResult(replaceSessionCookie(params)); } });
 const adoptSessionCookieTool = defineTool({ name: "adopt_session_cookie", label: "Adopt Session Cookie", description: "Adopt a named account session from current-run GET /sessions evidence without returning its value.", parameters: Type.Object({ evidence_id: Type.String(), cookie_name: Type.String(), account_key: Type.String() }), async execute(_id, params) { return textResult(adoptSessionCookie(params)); } });
  const verifyFlagTool = defineTool({ name: "verify_flag", label: "Verify Flag", description: "Verify a literal or bounded, provenance-backed derived flag against retained evidence and persist the solved result.", parameters: Type.Object({ evidence_id: Type.String(), candidate: Type.Optional(Type.String()), derivation: Type.Optional(Type.Object({ source_evidence_id: Type.Optional(Type.String()), source_evidence_ids: Type.Optional(Type.Array(Type.String())), operation: Type.Union([Type.Literal("base64_decode"), Type.Literal("url_decode"), Type.Literal("hex_decode"), Type.Literal("xor_repeat"), Type.Literal("concat")]), offset: Type.Optional(Type.Number()), length: Type.Optional(Type.Number()), key_base64: Type.Optional(Type.String()) })) }), async execute(_id, params) { return textResult(verifyFlag(params)); } });
 const finalizeResultTool = defineTool({ name: "finalize_result", label: "Finalize Result", description: "Persist a safe terminal non-solved result when the direct Web solve cannot continue.", parameters: Type.Object({ status: Type.Union([Type.Literal("not_solved"), Type.Literal("timeout"), Type.Literal("action_budget_exhausted"), Type.Literal("infrastructure_failure")]), reason_code: Type.Optional(Type.Union([Type.Literal("no_progress"), Type.Literal("deadline_reached"), Type.Literal("action_budget_reached"), Type.Literal("runner_failure")])) }), async execute(_id, params) { return textResult(finalizeResult(params)); } });
 const localCommandTool = defineTool({ name: "run_local_command", label: "Analyze Source", description: "Run one bounded read-only analysis profile against supplied source.", parameters: Type.Object({ profile: Type.String(), paths: Type.Array(Type.String()), args: Type.Optional(Type.Array(Type.String())), timeout_ms: Type.Number() }), async execute(_id, params) { return textResult(await localCommand(params)); } });
+  const writeWorkFileTool = defineTool({ name: "write_work_file", label: "Write Work File", description: "Write one bounded file into the sandboxed work directory for the current competition run.", parameters: Type.Object({ filename: Type.String({ maxLength: 64 }), content: Type.String({ maxLength: 65536 }), description: Type.String({ maxLength: 256 }) }), async execute(_id, params) { return textResult(writeWorkFile(params)); } });
+  const runPythonTool = defineTool({ name: "run_python", label: "Run Python", description: "Execute one Python script from the sandboxed work directory with bounded stdin, arguments, and runtime. Optional input_files copies up to 4 files from the source, private evidence, or work directories into work/ before the script runs.", parameters: Type.Object({ filename: Type.String({ maxLength: 64 }), args: Type.Optional(Type.Array(Type.String({ maxLength: 256 }))), stdin_text: Type.Optional(Type.String({ maxLength: 4096 })), input_files: Type.Optional(Type.Array(Type.String({ maxLength: 64 }))), timeout_seconds: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(runPython(params)); } });
+const tcpConnectTool = defineTool({ name: "tcp_connect", label: "TCP Connect", description: "Open a bounded TCP socket to the authorized origin host, send data (raw text or hex if prefixed with 0x), read up to read_bytes, and retain the response evidence.", parameters: Type.Object({ host: Type.String(), port: Type.Number(), data: Type.Optional(Type.String()), timeout_seconds: Type.Optional(Type.Number()), read_bytes: Type.Optional(Type.Number()) }), async execute(_id, params) { return textResult(await tcpConnect(params)); } });
  const originalLocalCommandExecute = localCommandTool.execute;
  localCommandTool.execute = async (id, params) => {
    activeRun.pendingAnalysisFingerprint = analysisFingerprint("run_local_command", { profile: params.profile, paths: params.paths, args: params.args ?? [] });
    try { return await originalLocalCommandExecute(id, params); } finally { if (activeRun) activeRun.pendingAnalysisFingerprint = null; }
  };
-      const competitionTools = [httpRequestTool, websocketExchangeTool, browserActionTool, startCompetitionRunTool, inspectEvidenceTool, listSourceTool, readSourceTool, searchSourceTool, computeDigestTool, deriveBinaryEvidenceTool, localCommandTool, replaceSessionCookieTool, adoptSessionCookieTool, verifyFlagTool, finalizeResultTool];
+        const competitionTools = [httpRequestTool, websocketExchangeTool, browserActionTool, startCompetitionRunTool, inspectEvidenceTool, listSourceTool, readSourceTool, searchSourceTool, computeDigestTool, deriveBinaryEvidenceTool, localCommandTool, replaceSessionCookieTool, adoptSessionCookieTool, verifyFlagTool, finalizeResultTool, writeWorkFileTool, runPythonTool, tcpConnectTool];
 for (const tool of competitionTools) {
   let execute = tool.execute;
   if (["list_source", "read_source", "search_source", "run_local_command"].includes(tool.name)) execute = capabilityAwareExecute(tool.name, execute);
@@ -1561,15 +1829,15 @@ export default function (pi) {
   pi.on("message_start", async (event) => {
     const text = challengeText(event.message);
     if (!text || !/\b(?:ctf|picoctf|challenge|flag|capture[\s-]*the[\s-]*flag)\b/i.test(text)) return;
-    let target;
     lastUserChallenge = text;
-    try { target = extractCompetitionTarget(text); } catch { return; }
+    let target;
+    try { target = extractTarget(text); } catch { return; }
     if (!target) return;
     try { ensureRuntimeCurrent(); } catch (error) { extensionApi?.setActiveTools([]); process.stderr.write(`${error.message}\n`); return; }
     retireExpiredRun();
     if (activeRun?.status === "active" && activeRun.target_origin === target.origin) return;
     extensionApi?.setActiveTools([]);
-    try { await startCompetitionRun({ challenge_text: text }, text); } catch (error) { process.stderr.write(`CTF-C interactive initialization failed: ${error.message}\n`); }
+    try { await startCompetitionRun({ challenge_text: text, flag_regex: detectFlagRegex(text) }, text); } catch (error) { process.stderr.write(`CTF-C interactive initialization failed: ${error.message}\n`); }
   });
   for (const tool of competitionTools) pi.registerTool(tool);
 }

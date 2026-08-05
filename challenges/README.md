@@ -1,6 +1,6 @@
 # Challenges
 
-Each challenge directory is created with `scripts/new_challenge.sh <safe-slug>` and must contain `challenge.md`, `notes.md`, `artifacts/`, `exploits/`, and `source/`.
+Each challenge directory was historically created with `scripts/new_challenge.sh <safe-slug>` (this script no longer exists; create challenge directories manually). A challenge directory must contain `challenge.md`, `notes.md`, `artifacts/`, `exploits/`, and `source/`.
 
 `challenge.md` is the declaration and authorization boundary. `notes.md` is for sanitized reasoning only. Generated content is ignored by default; do not place flags, secrets, cookies, tokens, logs, source archives, or final exploit payloads in tracked files.
 

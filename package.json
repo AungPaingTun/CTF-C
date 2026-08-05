@@ -1,7 +1,11 @@
 {
   "name": "ctf-c",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
+    "test": "bash scripts/run_all_tests.sh",
     "test:real-model": "node scripts/replay_real_model.mjs",
     "test:browser": "scripts/test_competition_browser.sh",
     "install:browser": "playwright install chromium"

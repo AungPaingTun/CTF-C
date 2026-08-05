@@ -1,4 +1,4 @@
-import { copyFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, delimiter, extname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -127,10 +127,22 @@ function uniqueName(directory, name) {
 function copyInput(input, sourceRoot, index) {
   const name = uniqueName(sourceRoot, basename(input));
   const destination = join(sourceRoot, name);
+  const sourceStat = statSync(input);
   copyFileSync(input, destination);
-  chmodSync(destination, 0o600);
+  const sourceMode = sourceStat.mode & 0o777;
+  const isExecutable = (sourceMode & 0o111) !== 0;
+  let isBinary = false;
+  try {
+    const fd = openSync(input, "r");
+    const header = Buffer.alloc(4);
+    readSync(fd, header, 0, 4, 0);
+    closeSync(fd);
+    if (header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46) isBinary = true;
+  } catch {}
+  const destMode = isExecutable || isBinary ? 0o700 : 0o600;
+  chmodSync(destination, destMode);
   const kind = archiveKind(input);
-  if (!kind) return { name, kind: "file", source_index: index };
+  if (!kind) return { name, kind: "file", source_index: index, is_executable: isExecutable, is_binary: isBinary };
   const extractedName = uniqueName(sourceRoot, name.replace(/\.tar\.gz$|\.tgz$|\.tar$|\.zip$/i, ""));
   const extracted = join(sourceRoot, extractedName);
   try {
@@ -139,7 +151,7 @@ function copyInput(input, sourceRoot, index) {
     rmSync(destination, { force: true });
     throw error;
   }
-  return { name, kind, extracted: extractedName, source_index: index };
+  return { name, kind, extracted: extractedName, source_index: index, is_binary: isBinary };
 }
 
 export function ingestCompetitionInputs(recordPath, text, { roots } = {}) {
@@ -167,6 +179,22 @@ export function ingestCompetitionInputs(recordPath, text, { roots } = {}) {
     }
   }
   const manifest = { accepted, rejected };
+  const binaryAnalyses = [];
+  for (const item of accepted) {
+    if (item.kind !== "file") continue;
+    const filePath = join(sourceRoot, item.name);
+    try {
+      const fileResult = spawnSync("/usr/bin/file", ["-b", filePath], { encoding: "utf8", timeout: 5000 });
+      const fileType = fileResult.status === 0 ? fileResult.stdout.trim() : null;
+      let stringsPreview = null;
+      try {
+        const stringsResult = spawnSync("/usr/bin/strings", [filePath], { encoding: "utf8", timeout: 5000, maxBuffer: 65536 });
+        if (stringsResult.status === 0) stringsPreview = stringsResult.stdout.slice(0, 4096);
+      } catch {}
+      if (fileType) binaryAnalyses.push({ name: item.name, file_type: fileType, strings_preview: stringsPreview });
+    } catch {}
+  }
+  if (binaryAnalyses.length) manifest.binary_analyses = binaryAnalyses;
   const manifestPath = join(sourceRoot, "supplied-inputs.json");
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
   chmodSync(manifestPath, 0o600);

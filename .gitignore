@@ -36,6 +36,10 @@ __pycache__/
 .pytest_cache/
 node_modules/
 
+# Editor
+.vscode/
+.idea/
+
 # Validation run output
 results/validation/
 

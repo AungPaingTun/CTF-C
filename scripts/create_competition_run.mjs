@@ -32,12 +32,21 @@ function validateTarget(raw) {
   try {
     target = new URL(raw);
   } catch {
-    fail("Target must be a valid URL");
+    const hostPort = raw.match(/^tcp:\/\/([A-Za-z0-9][-A-Za-z0-9.]*):(\d{1,5})$/);
+    if (hostPort) {
+      const port = parseInt(hostPort[2], 10);
+      if (port < 1 || port > 65535) fail("Invalid TCP port");
+      return raw;
+    }
+    fail("Target must be a valid URL or tcp://host:port");
   }
-  if (!target || !["http:", "https:"].includes(target.protocol)) fail("Target must use http or https");
+  const isHttp = ["http:", "https:"].includes(target.protocol);
+  const isTcp = target.protocol === "tcp:";
+  if (!isHttp && !isTcp) fail("Target must use http, https, or tcp protocol");
   if (target.username || target.password) fail("Target credentials are not allowed");
   if (target.hash) fail("Target fragments are not allowed");
-  if (target.pathname !== "/" || target.search) fail("Target must be an exact origin without a path or query");
+  if (isHttp && (target.pathname !== "/" || target.search)) fail("HTTP target must be an exact origin without a path or query");
+  if (isTcp) return `${target.protocol}//${target.host}`;
   return `${target.protocol}//${target.host}`;
 }
 
@@ -92,9 +101,15 @@ const args = process.argv.slice(2);
 if (!args.includes("--approve")) fail("Explicit --approve is required");
 const insecureTls = args.includes("--allow-insecure-tls");
 const targetOrigin = validateTarget(value(args, "--target"));
+const runType = value(args, "--run-type", false) || "web";
+if (!["web", "binary"].includes(runType)) fail("Run type must be web or binary");
 const sourceRoot = existingDirectory(value(args, "--source", false), "Source");
-const timeBudget = positiveInteger(value(args, "--time-budget", false), "Time budget", 15, 30);
-const actionBudget = positiveInteger(value(args, "--action-budget", false), "Action budget", 20, 60);
+const timeFallback = runType === "binary" ? 30 : 15;
+const timeMax = runType === "binary" ? 45 : 30;
+const actionFallback = runType === "binary" ? 100 : 20;
+const actionMax = runType === "binary" ? 120 : 60;
+const timeBudget = positiveInteger(value(args, "--time-budget", false), "Time budget", timeFallback, timeMax);
+const actionBudget = positiveInteger(value(args, "--action-budget", false), "Action budget", actionFallback, actionMax);
 const description = descriptionValue(args);
 const flagRegex = flagRegexValue(args);
 const projectRoot = process.env.CTFC_PROJECT_ROOT ? resolve(process.env.CTFC_PROJECT_ROOT) : process.cwd();
@@ -120,6 +135,7 @@ const record = {
   target_origin: targetOrigin,
   approved: true,
   description,
+  run_type: runType,
   source_root: sourceRoot,
   time_budget: timeBudget,
   action_budget: actionBudget,

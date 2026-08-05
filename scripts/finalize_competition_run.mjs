@@ -1,6 +1,53 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { failureReason, finalOutput } from "./competition_output.mjs";
+
+const ABANDONED_TIMEOUT_MS = 10 * 60 * 1000;
+
+function findAndFinalizeAbandonedRuns() {
+  const runsDir = join(process.cwd(), ".ctf-c", "competition-runs");
+  if (!existsSync(runsDir)) return;
+  const writeAtomic = (path, content) => {
+    const temporary = `${path}.tmp-${randomUUID()}`;
+    writeFileSync(temporary, content, { mode: 0o600 });
+    renameSync(temporary, path);
+  };
+  const now = Date.now();
+  for (const entry of readdirSync(runsDir)) {
+    if (!entry.startsWith("run-")) continue;
+    const runDir = join(runsDir, entry);
+    if (!lstatSync(runDir).isDirectory()) continue;
+    const statePath = join(runDir, "execution-state.json");
+    const resultPath = join(runDir, "result.json");
+    if (!existsSync(statePath) || existsSync(resultPath)) continue;
+    let state;
+    try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { continue; }
+    if (state.status !== "active") continue;
+    const startedAt = Number.isSafeInteger(state.started_at) ? state.started_at : 0;
+    const age = startedAt > 0 ? now - startedAt : now - Math.floor(lstatSync(statePath).mtimeMs);
+    if (age < ABANDONED_TIMEOUT_MS) continue;
+    process.stderr.write(`Abandoned run ${state.run_id ?? entry}: finalizing as abandoned (${Math.round(age / 60000)}m since start)\n`);
+    const result = {
+      status: "abandoned",
+      reason: "process terminated without finalization",
+      run_id: state.run_id ?? entry,
+      action_count: state.action_count ?? 0,
+      evidence_sequence: state.evidence_sequence ?? 0,
+      last_evidence_hash: state.last_evidence_hash ?? null,
+      exploration_budget_used: state.exploration_budget_used ?? 0,
+      exploration_budget_remaining: state.exploration_budget_remaining ?? 5,
+      finalized_at: new Date().toISOString(),
+    };
+    writeAtomic(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+    writeAtomic(statePath, `${JSON.stringify({ ...state, status: "abandoned" }, null, 2)}\n`);
+  }
+}
+
+if (process.argv.includes("--sweep-abandoned")) {
+  findAndFinalizeAbandonedRuns();
+  process.exit(0);
+}
 
 const [recordPath, rawExitCode] = process.argv.slice(2);
 if (!recordPath || !/^\d+$/.test(rawExitCode ?? "")) process.exit(2);
