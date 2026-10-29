@@ -6,7 +6,7 @@ linked evidence for every step, and stops when it has verified a flag or run out
 budget. Runs in OpenCode, with a Pi coding agent as a subagent through a typed-tool extension, and every action is
 confined to a per-run sandbox.
 
-Built for the UCSI Agentic AI CTF Hackathon 2026 and used there by team **Cooked by Code**.
+Built for the Agentic AI-Driven CTF Hackathon 2026 (held at UCSI University) and used there by team **Cooked by Code**.
 
 ## What it does
 
